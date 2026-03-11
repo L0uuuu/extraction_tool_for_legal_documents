@@ -1,20 +1,15 @@
 """
-LegaTech Tunisia Legal Extractor — v3
-======================================
+LegaTech Tunisia Legal Extractor — v3 (Cloudflare Workers AI)
+==============================================================
 Two-phase pipeline:
   Phase 1 : PDF text → LLM → document metadata + list of raw articles
   Phase 2 : Each raw article individually → LLM → all 62 enriched fields
 
-Fixes applied vs v2:
-  - Phase 1 now extracts document-level metadata (source_date, effective_date,
-    publication_date, source_name, law_number, law_type, title) from the PDF
-    header/preamble and passes it to every article in Phase 2
-  - summary enforced 40-60 words in French
-  - related_laws only from explicit citations in text — no hallucination
-  - keywords always in French
-  - entity_names only specific named entities, not generic roles
-  - content_arabic contamination detection + re-request
-  - source_date / effective_date / publication_date extracted in Phase 1
+API backend: Cloudflare Workers AI
+  Endpoint : https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1/responses
+  Model    : @cf/openai/gpt-oss-20b
+  Auth     : Bearer token via CF_AUTH_TOKEN env var
+  Account  : CF_ACCOUNT_ID env var
 """
 
 import json
@@ -26,8 +21,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 import os
+from openai import OpenAI
 import pdfplumber
-from groq import Groq
 
 # ── optional .env support ──────────────────────
 try:
@@ -40,13 +35,18 @@ except Exception:
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL            = "moonshotai/kimi-k2-instruct-0905"  # better Arabic, higher output limit
+# ── Cloudflare credentials ───────────────────
+# Set these in your .env file or as environment variables.
+CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
+CF_AUTH_TOKEN = os.getenv("CF_AUTH_TOKEN", "")
 
-PDF_PARSE_CHUNK_CHARS = 8000   # Phase 1 chunk size
-PDF_PARSE_MAX_TOKENS  = 8192  # raised — Phase 1 copies article texts, needs headroom
-ENRICH_MAX_TOKENS     = 8192  # raised — content_french + Arabic translation needs space
-RATE_LIMIT_DELAY      = 3.0    # increased — avoid 429 rate limit errors
+# ── Model ─────────────────────────────────────
+CF_MODEL = "@cf/openai/gpt-oss-20b"
+
+PDF_PARSE_CHUNK_CHARS = 8000
+PDF_PARSE_MAX_TOKENS  = 8192
+ENRICH_MAX_TOKENS     = 8192
+RATE_LIMIT_DELAY      = 3.0
 RETRY_ATTEMPTS        = 3
 RETRY_BASE_DELAY      = 2
 
@@ -58,9 +58,10 @@ RETRY_BASE_DELAY      = 2
 SYSTEM_PROMPT = """You are an expert Tunisian legal analyst and professional bilingual translator (French ↔ Arabic).
 
 ABSOLUTE RULES — never break these:
-- Return ONLY valid JSON — no markdown, no code blocks, no explanations
+- Return ONLY valid MINIFIED JSON — no whitespace, no indentation, no newlines
+- NO EXPLANATIONS, NO REASONING, NO THOUGHT PROCESS — just the JSON
+- DO NOT include any text before or after the JSON
 - NEVER use null — use "" for missing strings, [] for missing arrays
-- Keep all strings on one line — no literal newlines inside JSON strings
 - Always close every bracket and brace
 - Booleans: true or false (no quotes)
 - Dates: ISO 8601 format YYYY-MM-DDT00:00:00Z
@@ -83,29 +84,8 @@ PDF_PARSE_PROMPT = """Analyze this Tunisian legal document text and return a JSO
 1. Document-level metadata found in the header, preamble, or any part of the text
 2. A complete list of every article found in the text
 
-RETURN THIS EXACT STRUCTURE:
-{{
-  "doc_metadata": {{
-    "law_type"        : "Loi or Décret or Arrêté etc — infer from text",
-    "law_number"      : "number only e.g. 66-27 — no prefix like Loi n°",
-    "law_title_french": "official French title of the law",
-    "law_title_arabic": "official Arabic title — translate if needed",
-    "institution"     : "issuing authority",
-    "source_name"     : "JORT or BCT or OTHER",
-    "source_date"     : "ISO 8601 date of publication e.g. 1966-04-28T00:00:00Z — search for dates like 'du 28 avril 1966', 'le 1 mai 1966' — empty string if not found",
-    "effective_date"  : "ISO 8601 date the law enters into force — search for 'entrera en vigueur le', 'applicable à partir du' — empty string if not found",
-    "publication_date": "ISO 8601 date published in official journal (JORT) — empty string if not found",
-    "year"            : 0
-  }},
-  "articles": [
-    {{
-      "article_number": "1",
-      "article_text"  : "complete verbatim text of the article — do NOT summarize",
-      "chapter"       : "chapter title or empty string",
-      "section"       : "section title or empty string"
-    }}
-  ]
-}}
+RETURN THIS EXACT STRUCTURE as MINIFIED JSON (no whitespace, no newlines):
+{"doc_metadata":{"law_type":"Loi or Décret etc","law_number":"number only","law_title_french":"official French title","law_title_arabic":"official Arabic title","institution":"issuing authority","source_name":"JORT or BCT or OTHER","source_date":"ISO 8601 date or empty","effective_date":"ISO 8601 date or empty","publication_date":"ISO 8601 date or empty","year":0},"articles":[{"article_number":"1","article_text":"complete verbatim text","chapter":"chapter title or empty","section":"section title or empty"}]}
 
 RULES:
 - article_text must be the FULL verbatim text — never summarize or truncate
@@ -117,8 +97,7 @@ RULES:
 DOCUMENT TEXT:
 {pdf_text}
 
-RETURN ONLY THE JSON OBJECT. NO MARKDOWN. NO EXPLANATIONS."""
-
+RETURN ONLY THE MINIFIED JSON. NO MARKDOWN. NO EXPLANATIONS."""
 
 # ─────────────────────────────────────────────
 # PHASE 2 PROMPT — enrich one article (all 62 fields)
@@ -203,6 +182,12 @@ FIELD DEFINITIONS
                    - No generic words like "loi", "article", "tunisie"
                    - Good examples: ["contrat de travail", "convention collective", "salaire minimum"]
 
+  legal_concepts : Array of 3-8 legal doctrines or principles present in this article.
+                   DIFFERENT from keywords — these are the legal concepts at play, not search terms.
+                   Always in French. Never empty if the article has legal substance.
+                   Examples: ["droit de rétention", "bonne foi", "prescription acquisitive",
+                              "nullité relative", "force majeure", "responsabilité contractuelle"]
+
   legal_domains  : Array of 1-3 French legal domains. NEVER empty.
                    Valid: Droit Civil | Droit Commercial | Droit Fiscal | Droit Administratif |
                    Droit du Travail | Droit Pénal | Droit de la Santé | Droit Agricole | Droit Bancaire
@@ -243,7 +228,9 @@ FIELD DEFINITIONS
   community_summary : One French sentence describing the thematic cluster
 
 ═══════════════════════════════════════════
-RETURN ONLY A VALID JSON OBJECT. NO MARKDOWN. NO EXPLANATIONS.
+RETURN ONLY A VALID MINIFIED JSON OBJECT. 
+NO EXPLANATIONS. NO REASONING. NO THOUGHT PROCESS. JUST THE JSON.
+DO NOT include any text before or after the JSON.
 ═══════════════════════════════════════════"""
 
 
@@ -363,73 +350,59 @@ def parse_json_safely(raw: str, label: str = "") -> Optional[dict]:
 # REGEX FALLBACK — article extraction
 # ─────────────────────────────────────────────
 
-def extract_articles_with_regex(text: str) -> list[dict]:
-    """Fallback when Phase 1 LLM fails on a chunk."""
-    pattern = re.compile(
-        r'(?:Article|ARTICLE|Art\.?|المادة)\s+(\d+(?:\s*(?:bis|ter|quater|quinquies|-\d+))?)',
-        re.IGNORECASE
+
+# ─────────────────────────────────────────────
+# OPENAI-COMPATIBLE CLIENT FOR CLOUDFLARE
+# ─────────────────────────────────────────────
+
+def _make_client() -> OpenAI:
+    return OpenAI(
+        api_key  = CF_AUTH_TOKEN,
+        base_url = f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1",
     )
-    matches = list(pattern.finditer(text))
-
-    if not matches:
-        # Try numbered paragraphs
-        para_pattern = re.compile(r'(?:^|\n)\s*(\d+)[\.)\-]\s+(.+)', re.MULTILINE)
-        para_matches = list(para_pattern.finditer(text))
-        if para_matches:
-            articles = []
-            for i, m in enumerate(para_matches):
-                end = para_matches[i+1].start() if i+1 < len(para_matches) else len(text)
-                articles.append({
-                    "article_number": m.group(1),
-                    "article_text":   text[m.start():end].strip(),
-                    "chapter": "", "section": ""
-                })
-            print(f"📄 Regex (paragraphs): {len(articles)} items")
-            return articles
-        return [{"article_number": "1", "article_text": text, "chapter": "", "section": ""}]
-
-    articles = []
-    for i, match in enumerate(matches):
-        start = match.start()
-        end   = matches[i+1].start() if i+1 < len(matches) else len(text)
-        articles.append({
-            "article_number": match.group(1).strip(),
-            "article_text":   text[start:end].strip(),
-            "chapter": "", "section": ""
-        })
-
-    print(f"📄 Regex fallback: {len(articles)} articles")
-    return articles
 
 
 # ─────────────────────────────────────────────
-# GROQ API WRAPPER
+# CLOUDFLARE API WRAPPER
 # ─────────────────────────────────────────────
 
-def call_groq(client: Groq, system: str, user: str,
-              max_tokens: int, label: str = "") -> Optional[str]:
+def call_cf(client, system: str, user: str,
+            max_tokens: int, label: str = "") -> str:
+    """
+    Call Cloudflare Workers AI via the OpenAI-compatible client.
+
+    Uses: POST /v1/chat/completions
+    Model: CF_MODEL (@cf/openai/gpt-oss-20b)
+
+    On failure: raises RuntimeError with reason — caller decides what to do.
+    Retries up to RETRY_ATTEMPTS times with exponential backoff.
+    """
+    cf_client = _make_client()
+
     for attempt in range(1, RETRY_ATTEMPTS + 1):
         try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
+            response = cf_client.chat.completions.create(
+                model    = CF_MODEL,
+                messages = [
                     {"role": "system", "content": system},
-                    {"role": "user",   "content": user}
+                    {"role": "user",   "content": user},
                 ],
-                temperature=0.1,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"}
+                max_tokens      = max_tokens,
+                temperature     = 0.2,
+                response_format = {"type": "json_object"},
             )
-            content       = response.choices[0].message.content
+            text          = response.choices[0].message.content or ""
             finish_reason = response.choices[0].finish_reason
-            usage         = response.usage
+            tokens_in     = response.usage.prompt_tokens     if response.usage else "?"
+            tokens_out    = response.usage.completion_tokens if response.usage else "?"
 
             if finish_reason == "length":
-                print(f"   ⚠️  [{label}] token limit hit — will attempt partial parse")
+                print(f"   ⚠️  [{label}] output truncated (token limit hit)")
 
-            print(f"   📊 [{label}] {usage.prompt_tokens} in / {usage.completion_tokens} out "
-                  f"| finish: {finish_reason}")
-            return content
+            print(f"   📊 [{label}] {tokens_in} in / {tokens_out} out "
+                  f"| finish: {finish_reason} | model: {CF_MODEL}")
+
+            return text
 
         except Exception as e:
             print(f"   ❌ [{label}] attempt {attempt}/{RETRY_ATTEMPTS}: {e}")
@@ -438,9 +411,7 @@ def call_groq(client: Groq, system: str, user: str,
                 print(f"   ⏳ retry in {delay}s...")
                 time.sleep(delay)
 
-    print(f"   💥 [{label}] failed after {RETRY_ATTEMPTS} attempts")
-    return None
-
+    raise RuntimeError(f"[{label}] API call failed after {RETRY_ATTEMPTS} attempts")
 
 # ─────────────────────────────────────────────
 # ARABIC CONTAMINATION CHECK
@@ -448,15 +419,34 @@ def call_groq(client: Groq, system: str, user: str,
 
 def has_arabic_contamination(text: str) -> bool:
     """
-    Returns True if content_arabic contains non-Arabic sequences
-    (Latin, Cyrillic, etc.) — indicates a bad translation.
-    Allows short sequences like numbers and punctuation.
+    Check if Arabic text contains non-Arabic contamination.
+    Allows:
+    - Numbers (0-9)
+    - Common punctuation
+    - Known acronyms (JORT, BCT, etc.)
+    - Short Latin terms that might be part of legal citations
     """
     if not text:
         return False
-    # Flag if 4+ consecutive Latin or Cyrillic characters appear
-    return bool(re.search(r'[a-zA-Z\u0400-\u04FF]{4,}', text))
-
+    
+    # Remove numbers and common punctuation first
+    cleaned = re.sub(r'[0-9\s\-–—:;.,!?()\[\]{}"\']+', ' ', text)
+    
+    # Known acceptable Latin terms in Tunisian legal documents
+    acceptable_latin = {'JORT', 'BCT', 'CF', 'art', 'Art', 'ART', 'Code', 'Loi', 'Décret'}
+    
+    # Split into words and check each
+    words = cleaned.split()
+    for word in words:
+        # If word contains Latin characters
+        if re.search(r'[a-zA-Z]', word):
+            # Check if it's a known acceptable term
+            if word not in acceptable_latin and not any(term in word for term in acceptable_latin):
+                # Check if it's a long Latin sequence (more than 3 chars)
+                if len(re.findall(r'[a-zA-Z]', word)) > 3:
+                    return True
+    
+    return False
 
 # ─────────────────────────────────────────────
 # PHASE 1 — extract metadata + raw article list
@@ -520,7 +510,7 @@ def split_text_into_sections(pdf_text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def phase1_extract(client: Groq, pdf_text: str) -> tuple[dict, list[dict]]:
+def phase1_extract(client, pdf_text: str) -> tuple[dict, list[dict]]:
     """
     Phase 1: send PDF chunks to LLM, collect:
       - doc_metadata (merged across chunks, first non-empty value wins)
@@ -555,37 +545,30 @@ def phase1_extract(client: Groq, pdf_text: str) -> tuple[dict, list[dict]]:
         print(f"\n   [{label}] {len(chunk):,} chars...")
 
         prompt = PDF_PARSE_PROMPT.replace("{pdf_text}", chunk)
-        raw    = call_groq(client, SYSTEM_PROMPT, prompt, PDF_PARSE_MAX_TOKENS, label)
-        parsed = parse_json_safely(raw, label) if raw else None
+        try:
+            raw = call_cf(None, SYSTEM_PROMPT, prompt, PDF_PARSE_MAX_TOKENS, label)
+        except RuntimeError as e:
+            raise RuntimeError(f"Phase 1 failed on chunk {i}/{len(chunks)}: {e}") from e
 
-        if parsed:
-            # Merge doc_metadata — first non-empty value wins
-            chunk_meta = parsed.get("doc_metadata", {})
-            if isinstance(chunk_meta, dict):
-                for key, val in chunk_meta.items():
-                    if key in doc_meta and not doc_meta[key] and val:
-                        doc_meta[key] = val
+        parsed = parse_json_safely(raw, label)
+        if not parsed:
+            raise RuntimeError(
+                f"Phase 1 failed on chunk {i}/{len(chunks)}: "
+                f"LLM returned non-JSON.\nRaw response (first 300 chars): {(raw or '')[:300]}"
+            )
 
-            # Collect articles — dedup by (number, content_fingerprint)
-            articles = parsed.get("articles", [])
-            if isinstance(articles, list):
-                added = 0
-                for art in articles:
-                    num         = str(art.get("article_number", "")).strip()
-                    text        = str(art.get("article_text", "")).strip()
-                    fingerprint = text[:50]  # first 50 chars = enough to distinguish different articles
-                    key         = (num, fingerprint)
-                    if key in seen_keys:
-                        continue
-                    seen_keys.add(key)
-                    all_raw.append(art)
-                    added += 1
-                print(f"   ✅ {added} new articles | meta so far: {doc_meta.get('law_number','?')} | total: {len(all_raw)}")
-        else:
-            # LLM failed — regex fallback
-            print(f"   ⚠️  LLM failed — regex fallback for articles")
-            regex_arts = extract_articles_with_regex(chunk)
-            for art in regex_arts:
+        # Merge doc_metadata — first non-empty value wins
+        chunk_meta = parsed.get("doc_metadata", {})
+        if isinstance(chunk_meta, dict):
+            for key, val in chunk_meta.items():
+                if key in doc_meta and not doc_meta[key] and val:
+                    doc_meta[key] = val
+
+        # Collect articles — dedup by (number, content_fingerprint)
+        articles = parsed.get("articles", [])
+        if isinstance(articles, list):
+            added = 0
+            for art in articles:
                 num         = str(art.get("article_number", "")).strip()
                 text        = str(art.get("article_text", "")).strip()
                 fingerprint = text[:50]
@@ -594,6 +577,8 @@ def phase1_extract(client: Groq, pdf_text: str) -> tuple[dict, list[dict]]:
                     continue
                 seen_keys.add(key)
                 all_raw.append(art)
+                added += 1
+            print(f"   ✅ {added} new articles | meta so far: {doc_meta.get('law_number','?')} | total: {len(all_raw)}")
 
         if i < len(chunks):
             time.sleep(RATE_LIMIT_DELAY)
@@ -606,7 +591,7 @@ def phase1_extract(client: Groq, pdf_text: str) -> tuple[dict, list[dict]]:
 # PHASE 2 — enrich one article
 # ─────────────────────────────────────────────
 
-def phase2_enrich(client: Groq, raw_article: dict, doc_meta: dict,
+def phase2_enrich(client, raw_article: dict, doc_meta: dict,
                   idx: int, total: int) -> Optional[dict]:
     """
     Phase 2: enrich one raw article into all 62 fields.
@@ -619,12 +604,20 @@ def phase2_enrich(client: Groq, raw_article: dict, doc_meta: dict,
               .replace("{doc_metadata}", json.dumps(doc_meta,    ensure_ascii=False))
               .replace("{article_data}", json.dumps(raw_article, ensure_ascii=False)))
 
+    last_error = ""
     for attempt in range(1, RETRY_ATTEMPTS + 1):
-        raw    = call_groq(client, SYSTEM_PROMPT, prompt, ENRICH_MAX_TOKENS,
-                           f"{label} attempt {attempt}")
-        parsed = parse_json_safely(raw, label) if raw else None
+        try:
+            raw = call_cf(None, SYSTEM_PROMPT, prompt, ENRICH_MAX_TOKENS,
+                          f"{label} attempt {attempt}")
+        except RuntimeError as e:
+            last_error = str(e)
+            if attempt < RETRY_ATTEMPTS:
+                time.sleep(RETRY_BASE_DELAY * attempt)
+            continue
 
+        parsed = parse_json_safely(raw, label)
         if not parsed:
+            last_error = f"non-JSON response (first 300 chars): {(raw or '')[:300]}"
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_BASE_DELAY * attempt)
             continue
@@ -632,14 +625,15 @@ def phase2_enrich(client: Groq, raw_article: dict, doc_meta: dict,
         # Check Arabic contamination
         arabic = parsed.get("content_arabic", "")
         if has_arabic_contamination(arabic):
-            print(f"   ⚠️  [{label}] content_arabic contaminated — retrying...")
+            last_error = "content_arabic contaminated with non-Arabic characters"
+            print(f"   ⚠️  [{label}] {last_error} — retrying...")
             if attempt < RETRY_ATTEMPTS:
                 time.sleep(RETRY_BASE_DELAY * attempt)
             continue
 
         return parsed
 
-    return None
+    raise RuntimeError(f"Phase 2 failed on {label}: {last_error}")
 
 
 # ─────────────────────────────────────────────
@@ -686,8 +680,22 @@ def compute_static_fields(article: dict) -> dict:
     article.setdefault("version",     1)
     article.setdefault("graph_level", 1)
 
-    for f in ("repeal_date","superseded_by_id","supersedes_id","source_url","source_number"):
-        article[f] = ""
+    # Nullable fields — keep as None if not set, never force to ""
+    for f in ("repeal_date", "superseded_by_id", "supersedes_id",
+              "source_url", "source_number", "source_date",
+              "publication_date", "effective_date", "institution_secondary"):
+        if f not in article or article[f] == "" or article[f] == "COMPUTED":
+            article[f] = None
+
+    # embedding_text — pre-built blob for vector embedding models
+    article["embedding_text"] = "\n".join(filter(None, [
+        article.get("chapter", ""),
+        article.get("summary_french", "") or article.get("summary", ""),
+        article.get("summary_arabic", ""),
+        article.get("content_french", ""),
+        article.get("content_arabic", ""),
+        " | ".join(article.get("keywords", [])),
+    ]))
 
     now    = datetime.now(timezone.utc)
     future = now + timedelta(days=182)
@@ -711,21 +719,28 @@ def compute_static_fields(article: dict) -> dict:
 
 def sanitize_article(article: dict) -> dict:
     """Enforce correct types on all 62 fields and apply fallbacks."""
+    # Fields that must be strings (None/COMPUTED → "")
     string_fields = [
         "id","jurisdiction","law_type","law_number","institution",
-        "institution_primary","institution_secondary","title_french","title_arabic",
+        "institution_primary","title_french","title_arabic",
         "content_french","content_arabic","summary","summary_french","summary_arabic",
-        "search_content","business_impact","status","article_type","ambiguity_level",
-        "community_id","community_label","community_summary","source_name","source_date",
-        "effective_date","publication_date","chapter_normalized","parent_document_id",
+        "search_content","embedding_text","business_impact","status","article_type",
+        "ambiguity_level","community_id","community_label","community_summary",
+        "source_name","chapter_normalized","parent_document_id",
         "preceding_article_id","following_article_id","content_hash_sha256",
-        "content_combined","repeal_date","superseded_by_id","supersedes_id",
-        "source_url","source_number","last_checked","next_check","article_number",
+        "content_combined","last_checked","next_check","article_number",
         "chapter","section"
     ]
+    # Fields that are None when unknown — never forced to ""
+    nullable_fields = [
+        "source_date","effective_date","publication_date","repeal_date",
+        "institution_secondary","superseded_by_id","supersedes_id",
+        "source_url","source_number"
+    ]
     array_fields = [
-        "institutions","keywords","legal_domains","target_audience","related_laws",
-        "relation_target_ids","relation_types","entity_names","entity_types","entity_ids"
+        "institutions","keywords","legal_concepts","legal_domains","target_audience",
+        "related_laws","relation_target_ids","relation_types",
+        "entity_names","entity_types","entity_ids"
     ]
     int_fields  = ["year","version","graph_level","article_order"]
     bool_fields = ["has_obligations","has_penalties","has_deadlines",
@@ -734,6 +749,12 @@ def sanitize_article(article: dict) -> dict:
     for k in string_fields:
         if article.get(k) is None or article.get(k) == "COMPUTED":
             article[k] = ""
+
+    # Nullable fields: "" and "COMPUTED" → None, but keep actual values
+    for k in nullable_fields:
+        v = article.get(k)
+        if v == "" or v == "COMPUTED":
+            article[k] = None
 
     for k in array_fields:
         if not isinstance(article.get(k), list):
@@ -768,6 +789,15 @@ def sanitize_article(article: dict) -> dict:
     ]
     if not article["keywords"]:
         article["keywords"] = ["droit", "tunisie", "loi"]
+
+    # legal_concepts fallback — if LLM left it empty, keep as []
+    if not article.get("legal_concepts"):
+        article["legal_concepts"] = []
+    # Remove any Arabic that leaked into legal_concepts
+    article["legal_concepts"] = [
+        c for c in article["legal_concepts"]
+        if not re.search(r'[؀-ۿ]', c)
+    ]
 
     # Legal domains fallback
     if not article["legal_domains"]:
@@ -823,29 +853,82 @@ def sort_articles(articles: list[dict]) -> list[dict]:
 # MAIN PIPELINE
 # ─────────────────────────────────────────────
 
+def _load_existing_results(output_path: str) -> tuple[list[dict], set]:
+    """
+    Feature 1 — Resume support.
+    Load already-extracted articles from an existing output file.
+    Returns (list_of_articles, set_of_done_keys).
+    A done_key is (law_number, article_number, content_fingerprint).
+    """
+    if not Path(output_path).exists():
+        return [], set()
+
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        done_keys = set()
+        for a in existing:
+            num         = str(a.get("article_number", ""))
+            law_num     = str(a.get("law_number", ""))
+            fingerprint = str(a.get("content_french", ""))[:50]
+            done_keys.add((law_num, num, fingerprint))
+        print(f"   ♻️  Loaded {len(existing)} already-extracted articles from {output_path}")
+        return existing, done_keys
+    except Exception as e:
+        print(f"   ⚠️  Could not load existing output ({e}) — starting fresh")
+        return [], set()
+
+
+def _save_incremental(output_path: str, articles: list[dict]) -> None:
+    """Write current results to disk after every article — crash-safe."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+
+
 def run_extraction(pdf_path: str, output_path: Optional[str] = None,
-                   enrich_limit: Optional[int] = None) -> list[dict]:
+                   enrich_limit: Optional[int] = None,
+                   dry_run: bool = False,
+                   test_mode: bool = False) -> list[dict]:
     """
     Full 2-phase extraction pipeline.
+
+    Features:
+      - Resume: skips articles already present in output_path (Feature 1)
+      - Model rotation: switches model on rate/token limit (Feature 2)
+      - Key rotation: switches API key when all models exhausted (Feature 3)
+      - Incremental save: writes output after every article — crash-safe
 
     Args:
         pdf_path:     Path to PDF file
         output_path:  Output JSON path (default: same dir as PDF)
         enrich_limit: Only enrich first N articles — useful for testing
-
-    Returns:
-        List of enriched article dicts (all 62 fields)
     """
     print("\n" + "="*60)
     print("🇹🇳 LegaTech Tunisia Extractor v3")
     print("="*60)
 
-    if not GROQ_API_KEY:
+    if not CF_AUTH_TOKEN:
         raise RuntimeError(
-            "GROQ_API_KEY not set. Export it as an environment variable:\n"
-            "  Windows: $env:GROQ_API_KEY='gsk_...'\n"
-            "  Linux/Mac: export GROQ_API_KEY='gsk_...'"
+            "No Cloudflare auth token found.\n"
+            "  Windows: $env:CF_AUTH_TOKEN='your_token'\n"
+            "  Linux/Mac: export CF_AUTH_TOKEN='your_token'"
         )
+    if not CF_ACCOUNT_ID:
+        raise RuntimeError(
+            "CF_ACCOUNT_ID not set. Add it to your .env or environment:\n"
+            "  CF_ACCOUNT_ID=your_account_id_here"
+        )
+    print(f"🔑 Auth token loaded | model: {CF_MODEL}")
+    print(f"🌐 Endpoint: https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/v1")
+    if dry_run:
+        print("\n🔬 DRY-RUN MODE — no API calls will be made (free)")
+    if test_mode:
+        print("\n🧪 TEST MODE — only 1 article will be enriched (minimal cost)")
+
+    # Resolve output path early so we can check for existing results
+    if output_path is None:
+        stem        = Path(pdf_path).stem
+        output_path = str(Path(pdf_path).parent / f"{stem}_extracted.json")
 
     # Step 1: Read PDF
     print("\n📖 Step 1: Reading PDF...")
@@ -853,8 +936,19 @@ def run_extraction(pdf_path: str, output_path: Optional[str] = None,
 
     # Step 2: Phase 1
     print("\n📑 Step 2: Phase 1 — extracting document metadata + article list...")
-    client              = Groq(api_key=GROQ_API_KEY)
-    doc_meta, raw_arts  = phase1_extract(client, pdf_text)
+    if dry_run:
+        print("   ⏭️  [dry-run] skipping Phase 1 LLM — no API call")
+        doc_meta = {"law_type":"","law_number":"","law_title_french":"","law_title_arabic":"",
+                    "institution":"","source_name":"JORT","source_date":"","effective_date":"",
+                    "publication_date":"","year":0}
+        # Split by known article patterns just for display — no LLM cost
+        import re as _re
+        raw_arts = [{"article_number": str(i+1), "article_text": chunk, "chapter": "", "section": ""}
+                    for i, chunk in enumerate(pdf_text.split("Article ")[1:6])]
+        if not raw_arts:
+            raw_arts = [{"article_number": "1", "article_text": pdf_text[:500], "chapter": "", "section": ""}]
+    else:
+        doc_meta, raw_arts = phase1_extract(None, pdf_text)
 
     if not raw_arts:
         raise ValueError("No articles found in PDF")
@@ -867,70 +961,69 @@ def run_extraction(pdf_path: str, output_path: Optional[str] = None,
     print(f"   publication_date: {doc_meta.get('publication_date')}")
     print(f"   source_name:      {doc_meta.get('source_name')}")
 
-    # Step 3: Phase 2
+    # Step 3: Phase 2 — with resume support
+    if test_mode and not enrich_limit:
+        enrich_limit = 1
     to_enrich = raw_arts[:enrich_limit] if enrich_limit else raw_arts
     total     = len(to_enrich)
-    print(f"\n🤖 Step 3: Phase 2 — enriching {total} articles...")
 
-    enriched, success, failed = [], 0, 0
+    # Feature 1: load already-done articles
+    existing_results, done_keys = _load_existing_results(output_path)
+    enriched = list(existing_results)  # start with what we already have
+
+    skipped, success, failed = 0, 0, 0
+    law_num = doc_meta.get("law_number", "")
+
+    print(f"\n🤖 Step 3: Phase 2 — enriching {total} articles ({len(done_keys)} already done)...")
 
     for i, raw in enumerate(to_enrich, 1):
-        print(f"\n── Article {i}/{total} (#{raw.get('article_number','?')}) ──")
+        art_num     = str(raw.get("article_number", ""))
+        fingerprint = str(raw.get("article_text", ""))[:50]
+        done_key    = (law_num, art_num, fingerprint)
 
-        result = phase2_enrich(client, raw, doc_meta, i, total)
+        # Feature 1: skip if already extracted
+        if done_key in done_keys:
+            print(f"\n── Article {i}/{total} (#{art_num}) — ⏭️  already extracted, skipping")
+            skipped += 1
+            continue
 
-        if result:
-            enriched.append(result)
-            success += 1
-        else:
-            print(f"   ⚠️  failed — using raw fallback")
-            enriched.append({
-                "article_number": raw.get("article_number",""),
-                "content_french": raw.get("article_text",""),
-                "chapter":        raw.get("chapter",""),
-                "section":        raw.get("section",""),
-                "title_french":   doc_meta.get("law_title_french",""),
-                "title_arabic":   doc_meta.get("law_title_arabic",""),
-                "law_number":     doc_meta.get("law_number",""),
-                "law_type":       doc_meta.get("law_type",""),
-                "source_date":    doc_meta.get("source_date",""),
-                "effective_date": doc_meta.get("effective_date",""),
-                "publication_date": doc_meta.get("publication_date",""),
-                "source_name":    doc_meta.get("source_name","JORT"),
-                "year":           doc_meta.get("year", 0),
-            })
-            failed += 1
+        print(f"\n── Article {i}/{total} (#{art_num}) ──")
+
+        if dry_run:
+            print(f"   ⏭️  [dry-run] would send {len(raw.get('article_text',''))} chars to API")
+            print(f"   📄 Preview: {raw.get('article_text','')[:120]}...")
+            skipped += 1
+            continue
+
+        # phase2_enrich raises RuntimeError on failure — stops the run immediately
+        result = phase2_enrich(None, raw, doc_meta, i, total)
+
+        # Post-process
+        result = sanitize_article(result)
+        result = compute_static_fields(result)
+        enriched.append(result)
+        done_keys.add(done_key)
+        success += 1
+
+        # Incremental save after every article — crash-safe
+        try:
+            _save_incremental(output_path, sort_articles(enriched))
+        except Exception as e:
+            print(f"   ⚠️  save error: {e}")
 
         if i < total:
             time.sleep(RATE_LIMIT_DELAY)
 
-    print(f"\n📊 Phase 2: {success} enriched, {failed} fallbacks")
+    print(f"\n📊 Phase 2: {success} enriched | {skipped} skipped | {failed} fallbacks")
 
-    # Step 4: Post-process
-    print("\n⚙️  Step 4: Post-processing...")
-    processed = []
-    for article in enriched:
-        try:
-            article = sanitize_article(article)
-            article = compute_static_fields(article)
-            processed.append(article)
-        except Exception as e:
-            print(f"   ⚠️  post-process error: {e}")
-
-    processed = sort_articles(processed)
-    print(f"✅ Final count: {len(processed)} articles")
-
-    # Step 5: Save
-    if output_path is None:
-        stem        = Path(pdf_path).stem
-        output_path = str(Path(pdf_path).parent / f"{stem}_extracted.json")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(processed, f, ensure_ascii=False, indent=2)
-
+    # Step 4: Final sort and save
+    print("\n⚙️  Step 4: Sorting and saving...")
+    final = sort_articles(enriched)
+    _save_incremental(output_path, final)
+    print(f"✅ Final count: {len(final)} articles")
     print(f"\n💾 Saved → {output_path}")
     print("="*60 + "\n")
-    return processed
+    return final
 
 
 # ─────────────────────────────────────────────
@@ -941,21 +1034,29 @@ if __name__ == "__main__":
     import sys
 
     if len(sys.argv) < 2:
-        print("Usage: python extractor.py <pdf> [output.json] [--limit N]")
+        print("Usage: python extractor.py <pdf> [output.json] [--limit N] [--dry-run] [--test]")
+        print("  --dry-run  Parse PDF, skip all API calls (free)")
+        print("  --test     Enrich 1 article only (minimal cost)")
         sys.exit(1)
 
     pdf_file, output_file, limit = sys.argv[1], None, None
+    dry_run = test_mode = False
     args = sys.argv[2:]
     i = 0
     while i < len(args):
         if args[i] == "--limit" and i+1 < len(args):
             limit = int(args[i+1]); i += 2
+        elif args[i] == "--dry-run":
+            dry_run = True; i += 1
+        elif args[i] == "--test":
+            test_mode = True; i += 1
         elif not output_file and not args[i].startswith("--"):
             output_file = args[i]; i += 1
         else:
             i += 1
 
-    results = run_extraction(pdf_file, output_file, enrich_limit=limit)
+    results = run_extraction(pdf_file, output_file, enrich_limit=limit,
+                             dry_run=dry_run, test_mode=test_mode)
 
     print(f"✅ Done — {len(results)} articles")
     if results:

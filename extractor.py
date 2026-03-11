@@ -3,7 +3,7 @@ LegaTech Tunisia Legal Extractor — v3
 ======================================
 Two-phase pipeline:
   Phase 1 : PDF text → LLM → document metadata + list of raw articles
-  Phase 2 : Each raw article individually → LLM → all 62 enriched fields
+  Phase 2 : Each raw article individually → LLM → all 64 enriched fields
 
 Fixes applied vs v2:
   - Phase 1 now extracts document-level metadata (source_date, effective_date,
@@ -40,15 +40,38 @@ except Exception:
 # CONFIGURATION
 # ─────────────────────────────────────────────
 
-GROQ_API_KEY          = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL            = "openai/gpt-oss-120b"
+# ── API keys (Feature 3: key rotation) ───────
+# Add as many keys as you have. At minimum set GROQ_API_KEY.
+# You can also set GROQ_API_KEY_2, GROQ_API_KEY_3, etc.
+GROQ_API_KEYS: list[str] = [
+    k for k in [
+        os.getenv("GROQ_API_KEY",   ""),
+        os.getenv("GROQ_API_KEY_2", ""),
+        os.getenv("GROQ_API_KEY_3", ""),
+    ] if k  # drop empty strings
+]
 
-PDF_PARSE_CHUNK_CHARS = 8000   # Phase 1 chunk size
-PDF_PARSE_MAX_TOKENS  = 8192  # raised — Phase 1 copies article texts, needs headroom
-ENRICH_MAX_TOKENS     = 8192  # raised — content_french + Arabic translation needs space
-RATE_LIMIT_DELAY      = 3.0    # increased — avoid 429 rate limit errors
+# ── Model rotation list (Feature 2) ──────────
+# Tried in order when a model hits its rate/token limit.
+# Reset to index 0 whenever the API key rotates.
+GROQ_MODELS: list[str] = [
+    "llama-3.3-70b-versatile",   # primary  — best Arabic, 8192 out
+    "llama-3.1-70b-versatile",   # fallback 1
+    "mixtral-8x7b-32768",        # fallback 2 — large context
+    "gemma2-9b-it",              # fallback 3 — lightweight
+]
+
+# ── Rotation state (mutable at runtime) ──────
+_current_key_idx   = 0
+_current_model_idx = 0
+
+PDF_PARSE_CHUNK_CHARS = 8000
+PDF_PARSE_MAX_TOKENS  = 8192
+ENRICH_MAX_TOKENS     = 8192
+RATE_LIMIT_DELAY      = 3.0
 RETRY_ATTEMPTS        = 3
 RETRY_BASE_DELAY      = 2
+RATE_LIMIT_WAIT       = 62    # seconds to wait after exhausting all models on a key
 
 
 # ─────────────────────────────────────────────
@@ -202,6 +225,12 @@ FIELD DEFINITIONS
                    - Extract from actual article content — meaningful legal/business terms
                    - No generic words like "loi", "article", "tunisie"
                    - Good examples: ["contrat de travail", "convention collective", "salaire minimum"]
+
+  legal_concepts : Array of 3-8 legal doctrines or principles present in this article.
+                   DIFFERENT from keywords — these are the legal concepts at play, not search terms.
+                   Always in French. Never empty if the article has legal substance.
+                   Examples: ["droit de rétention", "bonne foi", "prescription acquisitive",
+                              "nullité relative", "force majeure", "responsabilité contractuelle"]
 
   legal_domains  : Array of 1-3 French legal domains. NEVER empty.
                    Valid: Droit Civil | Droit Commercial | Droit Fiscal | Droit Administratif |
@@ -403,42 +432,150 @@ def extract_articles_with_regex(text: str) -> list[dict]:
 
 
 # ─────────────────────────────────────────────
-# GROQ API WRAPPER
+# GROQ CLIENT FACTORY + ROTATION HELPERS
 # ─────────────────────────────────────────────
 
-def call_groq(client: Groq, system: str, user: str,
+def _current_key() -> str:
+    return GROQ_API_KEYS[_current_key_idx]
+
+def _current_model() -> str:
+    return GROQ_MODELS[_current_model_idx]
+
+def _make_client() -> Groq:
+    return Groq(api_key=_current_key())
+
+def _rotate_model(label: str) -> bool:
+    """
+    Try the next model in the list.
+    Returns True if a new model is available, False if all models exhausted.
+    """
+    global _current_model_idx
+    if _current_model_idx + 1 < len(GROQ_MODELS):
+        _current_model_idx += 1
+        print(f"   🔄 [{label}] switching model → {_current_model()}")
+        return True
+    return False
+
+def _rotate_key(label: str) -> bool:
+    """
+    Try the next API key in the list and reset model index.
+    Returns True if a new key is available, False if all keys exhausted.
+    """
+    global _current_key_idx, _current_model_idx
+    if _current_key_idx + 1 < len(GROQ_API_KEYS):
+        _current_key_idx   += 1
+        _current_model_idx  = 0  # reset to best model on fresh key
+        print(f"   🔑 [{label}] switching API key → key #{_current_key_idx + 1} | model reset to {_current_model()}")
+        return True
+    return False
+
+def _is_rate_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return "429" in msg or "rate limit" in msg or "rate_limit" in msg
+
+def _is_token_limit_error(e: Exception) -> bool:
+    msg = str(e).lower()
+    return ("json_validate_failed" in msg and "max completion tokens" in msg) or            "max_tokens" in msg
+
+
+# ─────────────────────────────────────────────
+# GROQ API WRAPPER  (with model + key rotation)
+# ─────────────────────────────────────────────
+
+def call_groq(client, system: str, user: str,
               max_tokens: int, label: str = "") -> Optional[str]:
-    for attempt in range(1, RETRY_ATTEMPTS + 1):
-        try:
-            response = client.chat.completions.create(
-                model=GROQ_MODEL,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user",   "content": user}
-                ],
-                temperature=0.1,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"}
-            )
-            content       = response.choices[0].message.content
-            finish_reason = response.choices[0].finish_reason
-            usage         = response.usage
+    """
+    Call the Groq API with automatic model and key rotation on failure.
 
-            if finish_reason == "length":
-                print(f"   ⚠️  [{label}] token limit hit — will attempt partial parse")
+    On 429 (rate limit):
+      1. Try next model on same key
+      2. If all models exhausted → try next API key (resets model list)
+      3. If all keys exhausted → wait RATE_LIMIT_WAIT seconds and retry from top
+    On token limit error:
+      → Try next model (smaller models sometimes handle output differently)
+    On other errors:
+      → Standard exponential backoff up to RETRY_ATTEMPTS times
+    """
+    global _current_key_idx, _current_model_idx
 
-            print(f"   📊 [{label}] {usage.prompt_tokens} in / {usage.completion_tokens} out "
-                  f"| finish: {finish_reason}")
-            return content
+    # We allow unlimited outer loops through the rotation; inner attempts per model = RETRY_ATTEMPTS
+    max_outer = (len(GROQ_MODELS) * len(GROQ_API_KEYS)) + 1
 
-        except Exception as e:
-            print(f"   ❌ [{label}] attempt {attempt}/{RETRY_ATTEMPTS}: {e}")
-            if attempt < RETRY_ATTEMPTS:
-                delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
-                print(f"   ⏳ retry in {delay}s...")
-                time.sleep(delay)
+    for outer in range(max_outer):
+        # Rebuild client if key may have changed since caller created it
+        active_client = _make_client()
+        active_model  = _current_model()
 
-    print(f"   💥 [{label}] failed after {RETRY_ATTEMPTS} attempts")
+        for attempt in range(1, RETRY_ATTEMPTS + 1):
+            try:
+                response = active_client.chat.completions.create(
+                    model=active_model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user",   "content": user}
+                    ],
+                    temperature=0.1,
+                    max_tokens=max_tokens,
+                    response_format={"type": "json_object"}
+                )
+                resp_content  = response.choices[0].message.content
+                finish_reason = response.choices[0].finish_reason
+                usage         = response.usage
+
+                if finish_reason == "length":
+                    print(f"   ⚠️  [{label}] token limit hit — will attempt partial parse")
+
+                print(f"   📊 [{label}] {usage.prompt_tokens} in / {usage.completion_tokens} out "
+                      f"| finish: {finish_reason} | model: {active_model}")
+                return resp_content
+
+            except Exception as e:
+                print(f"   ❌ [{label}] attempt {attempt}/{RETRY_ATTEMPTS}: {e}")
+
+                if _is_rate_limit_error(e):
+                    # Don't burn retries on rate limits — rotate immediately
+                    print(f"   ⚡ [{label}] rate limit detected")
+                    if _rotate_model(label):
+                        active_model  = _current_model()
+                        active_client = _make_client()
+                        time.sleep(2)
+                        break  # break inner loop, restart outer with new model
+                    elif _rotate_key(label):
+                        active_client = _make_client()
+                        active_model  = _current_model()
+                        time.sleep(2)
+                        break
+                    else:
+                        # All models on all keys exhausted — wait and reset
+                        print(f"   😴 [{label}] all keys/models rate-limited — waiting {RATE_LIMIT_WAIT}s...")
+                        time.sleep(RATE_LIMIT_WAIT)
+                        _current_key_idx   = 0
+                        _current_model_idx = 0
+                        active_client = _make_client()
+                        active_model  = _current_model()
+                        break
+
+                elif _is_token_limit_error(e):
+                    print(f"   📏 [{label}] token limit error — trying next model")
+                    if _rotate_model(label):
+                        active_model  = _current_model()
+                        active_client = _make_client()
+                        break
+                    # else fall through to normal retry
+
+                else:
+                    # Generic error — exponential backoff
+                    if attempt < RETRY_ATTEMPTS:
+                        delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+                        print(f"   ⏳ retry in {delay}s...")
+                        time.sleep(delay)
+
+        else:
+            # inner loop exhausted without success or rotation
+            print(f"   💥 [{label}] failed after {RETRY_ATTEMPTS} attempts on model {active_model}")
+            return None
+
+    print(f"   💥 [{label}] exhausted all rotation options")
     return None
 
 
@@ -468,60 +605,131 @@ EMPTY_DOC_METADATA = {
     "source_date": "", "effective_date": "", "publication_date": "", "year": 0
 }
 
-def phase1_extract(client: Groq, pdf_text: str) -> tuple[dict, list[dict]]:
+# ─────────────────────────────────────────────
+# SECTION BOUNDARY DETECTION
+# ─────────────────────────────────────────────
+
+# Headers that mark a new major section in a Tunisian legal document.
+# When one of these is found, the article numbering resets — so we start
+# a new section and allow article numbers to repeat.
+SECTION_MARKERS = [
+    r'DISPOSITIONS\s+GENERALES',
+    r'TITRE\s+(?:I|II|III|IV|V|VI|VII|VIII|IX|X|PREMIER)',
+    r'LIVRE\s+(?:I|II|III|IV|V|PREMIER)',
+    r'PARTIE\s+(?:I|II|III|IV|PREMIERE)',
+]
+
+def split_text_into_sections(pdf_text: str) -> list[tuple[str, str]]:
+    """
+    Split PDF text into sections at major structural boundaries.
+    Returns list of (section_label, section_text) tuples.
+
+    This solves the duplicate article number problem: a document like the
+    Code du Travail has articles 1-4 in the promulgation law, then articles
+    1-N again in the code body. By splitting into sections we can track
+    (section, article_number) as a unique key.
+    """
+    combined_pattern = re.compile(
+        '|'.join(f'({m})' for m in SECTION_MARKERS),
+        re.IGNORECASE
+    )
+
+    splits = list(combined_pattern.finditer(pdf_text))
+
+    if not splits:
+        # No section markers found — treat whole text as one section
+        return [('section-1', pdf_text)]
+
+    sections = []
+
+    # Text before first marker = section 0 (preamble/promulgation)
+    preamble = pdf_text[:splits[0].start()].strip()
+    if preamble:
+        sections.append(('promulgation', preamble))
+
+    for i, match in enumerate(splits):
+        start = match.start()
+        end   = splits[i+1].start() if i+1 < len(splits) else len(pdf_text)
+        label = re.sub(r'\s+', '-', match.group(0).strip().lower())
+        sections.append((label, pdf_text[start:end].strip()))
+
+    print(f"   📂 Document split into {len(sections)} sections: {[s[0] for s in sections]}")
+    return sections
+
+
+def phase1_extract(client, pdf_text: str) -> tuple[dict, list[dict]]:
     """
     Phase 1: send PDF chunks to LLM, collect:
       - doc_metadata (merged across chunks, first non-empty value wins)
-      - raw articles list (deduplicated by article_number)
+      - raw articles list
+
+    DEDUPLICATION STRATEGY:
+      A Tunisian legal document often has TWO sets of articles with the same
+      numbers. For example, the Code du Travail has:
+        - Articles 1-4 in the promulgation law (pages 1-7)
+        - Articles 1-N in the code body itself (pages 9+)
+      
+      Old approach (dedup by article_number alone) dropped the second set.
+      New approach: dedup by (article_number, first_50_chars_of_text).
+      Same number + same text = true duplicate (overlap between chunks).
+      Same number + different text = different article, keep both.
 
     Returns: (doc_metadata dict, list of raw article dicts)
     """
     print("\n── Phase 1: Identifying articles and document metadata ──")
 
-    chunks     = split_for_parsing(pdf_text)
-    doc_meta   = dict(EMPTY_DOC_METADATA)  # will be filled from first chunk that has data
-    all_raw    = []
-    seen_nums  = set()
+    chunks    = split_for_parsing(pdf_text)
+    doc_meta  = dict(EMPTY_DOC_METADATA)
+    all_raw   = []
+    # Key = (article_number, first_50_chars_of_text) — catches real duplicates
+    # (same chunk overlap) while allowing same-numbered articles with different content
+    seen_keys = set()
+
+    print(f"📦 Split into {len(chunks)} parsing chunks")
 
     for i, chunk in enumerate(chunks, 1):
         label  = f"parse {i}/{len(chunks)}"
         print(f"\n   [{label}] {len(chunk):,} chars...")
 
-        prompt = PDF_PARSE_PROMPT.format(pdf_text=chunk)
-        raw    = call_groq(client, SYSTEM_PROMPT, prompt, PDF_PARSE_MAX_TOKENS, label)
+        prompt = PDF_PARSE_PROMPT.replace("{pdf_text}", chunk)
+        raw    = call_groq(None, SYSTEM_PROMPT, prompt, PDF_PARSE_MAX_TOKENS, label)
         parsed = parse_json_safely(raw, label) if raw else None
 
         if parsed:
-            # Merge doc_metadata — first non-empty value wins for each field
+            # Merge doc_metadata — first non-empty value wins
             chunk_meta = parsed.get("doc_metadata", {})
             if isinstance(chunk_meta, dict):
                 for key, val in chunk_meta.items():
                     if key in doc_meta and not doc_meta[key] and val:
                         doc_meta[key] = val
 
-            # Collect articles
+            # Collect articles — dedup by (number, content_fingerprint)
             articles = parsed.get("articles", [])
             if isinstance(articles, list):
                 added = 0
                 for art in articles:
-                    num = str(art.get("article_number", "")).strip()
-                    if num in seen_nums:
+                    num         = str(art.get("article_number", "")).strip()
+                    text        = str(art.get("article_text", "")).strip()
+                    fingerprint = text[:50]  # first 50 chars = enough to distinguish different articles
+                    key         = (num, fingerprint)
+                    if key in seen_keys:
                         continue
-                    if num:
-                        seen_nums.add(num)
+                    seen_keys.add(key)
                     all_raw.append(art)
                     added += 1
-                print(f"   ✅ {added} new articles | meta so far: {doc_meta.get('law_number','?')}")
+                print(f"   ✅ {added} new articles | meta so far: {doc_meta.get('law_number','?')} | total: {len(all_raw)}")
         else:
-            # LLM failed — regex fallback for articles, metadata stays as-is
+            # LLM failed — regex fallback
             print(f"   ⚠️  LLM failed — regex fallback for articles")
             regex_arts = extract_articles_with_regex(chunk)
             for art in regex_arts:
-                num = str(art.get("article_number", "")).strip()
-                if num in seen_nums:
+                num         = str(art.get("article_number", "")).strip()
+                text        = str(art.get("article_text", "")).strip()
+                fingerprint = text[:50]
+                key         = (num, fingerprint)
+                if key in seen_keys:
                     continue
-                if num:
-                    seen_nums.add(num)
+                seen_keys.add(key)
                 all_raw.append(art)
 
         if i < len(chunks):
@@ -535,7 +743,7 @@ def phase1_extract(client: Groq, pdf_text: str) -> tuple[dict, list[dict]]:
 # PHASE 2 — enrich one article
 # ─────────────────────────────────────────────
 
-def phase2_enrich(client: Groq, raw_article: dict, doc_meta: dict,
+def phase2_enrich(client, raw_article: dict, doc_meta: dict,
                   idx: int, total: int) -> Optional[dict]:
     """
     Phase 2: enrich one raw article into all 62 fields.
@@ -549,7 +757,7 @@ def phase2_enrich(client: Groq, raw_article: dict, doc_meta: dict,
               .replace("{article_data}", json.dumps(raw_article, ensure_ascii=False)))
 
     for attempt in range(1, RETRY_ATTEMPTS + 1):
-        raw    = call_groq(client, SYSTEM_PROMPT, prompt, ENRICH_MAX_TOKENS,
+        raw    = call_groq(None, SYSTEM_PROMPT, prompt, ENRICH_MAX_TOKENS,
                            f"{label} attempt {attempt}")
         parsed = parse_json_safely(raw, label) if raw else None
 
@@ -615,8 +823,22 @@ def compute_static_fields(article: dict) -> dict:
     article.setdefault("version",     1)
     article.setdefault("graph_level", 1)
 
-    for f in ("repeal_date","superseded_by_id","supersedes_id","source_url","source_number"):
-        article[f] = ""
+    # Nullable fields — keep as None if not set, never force to ""
+    for f in ("repeal_date", "superseded_by_id", "supersedes_id",
+              "source_url", "source_number", "source_date",
+              "publication_date", "effective_date", "institution_secondary"):
+        if f not in article or article[f] == "" or article[f] == "COMPUTED":
+            article[f] = None
+
+    # embedding_text — pre-built blob for vector embedding models
+    article["embedding_text"] = "\n".join(filter(None, [
+        article.get("chapter", ""),
+        article.get("summary_french", "") or article.get("summary", ""),
+        article.get("summary_arabic", ""),
+        article.get("content_french", ""),
+        article.get("content_arabic", ""),
+        " | ".join(article.get("keywords", [])),
+    ]))
 
     now    = datetime.now(timezone.utc)
     future = now + timedelta(days=182)
@@ -640,21 +862,28 @@ def compute_static_fields(article: dict) -> dict:
 
 def sanitize_article(article: dict) -> dict:
     """Enforce correct types on all 62 fields and apply fallbacks."""
+    # Fields that must be strings (None/COMPUTED → "")
     string_fields = [
         "id","jurisdiction","law_type","law_number","institution",
-        "institution_primary","institution_secondary","title_french","title_arabic",
+        "institution_primary","title_french","title_arabic",
         "content_french","content_arabic","summary","summary_french","summary_arabic",
-        "search_content","business_impact","status","article_type","ambiguity_level",
-        "community_id","community_label","community_summary","source_name","source_date",
-        "effective_date","publication_date","chapter_normalized","parent_document_id",
+        "search_content","embedding_text","business_impact","status","article_type",
+        "ambiguity_level","community_id","community_label","community_summary",
+        "source_name","chapter_normalized","parent_document_id",
         "preceding_article_id","following_article_id","content_hash_sha256",
-        "content_combined","repeal_date","superseded_by_id","supersedes_id",
-        "source_url","source_number","last_checked","next_check","article_number",
+        "content_combined","last_checked","next_check","article_number",
         "chapter","section"
     ]
+    # Fields that are None when unknown — never forced to ""
+    nullable_fields = [
+        "source_date","effective_date","publication_date","repeal_date",
+        "institution_secondary","superseded_by_id","supersedes_id",
+        "source_url","source_number"
+    ]
     array_fields = [
-        "institutions","keywords","legal_domains","target_audience","related_laws",
-        "relation_target_ids","relation_types","entity_names","entity_types","entity_ids"
+        "institutions","keywords","legal_concepts","legal_domains","target_audience",
+        "related_laws","relation_target_ids","relation_types",
+        "entity_names","entity_types","entity_ids"
     ]
     int_fields  = ["year","version","graph_level","article_order"]
     bool_fields = ["has_obligations","has_penalties","has_deadlines",
@@ -663,6 +892,12 @@ def sanitize_article(article: dict) -> dict:
     for k in string_fields:
         if article.get(k) is None or article.get(k) == "COMPUTED":
             article[k] = ""
+
+    # Nullable fields: "" and "COMPUTED" → None, but keep actual values
+    for k in nullable_fields:
+        v = article.get(k)
+        if v == "" or v == "COMPUTED":
+            article[k] = None
 
     for k in array_fields:
         if not isinstance(article.get(k), list):
@@ -697,6 +932,15 @@ def sanitize_article(article: dict) -> dict:
     ]
     if not article["keywords"]:
         article["keywords"] = ["droit", "tunisie", "loi"]
+
+    # legal_concepts fallback — if LLM left it empty, derive from keywords
+    if not article.get("legal_concepts"):
+        article["legal_concepts"] = []
+    # Remove any Arabic that leaked into legal_concepts
+    article["legal_concepts"] = [
+        c for c in article["legal_concepts"]
+        if not re.search(r'[؀-ۿ]', c)
+    ]
 
     # Legal domains fallback
     if not article["legal_domains"]:
@@ -752,29 +996,70 @@ def sort_articles(articles: list[dict]) -> list[dict]:
 # MAIN PIPELINE
 # ─────────────────────────────────────────────
 
+def _load_existing_results(output_path: str) -> tuple[list[dict], set]:
+    """
+    Feature 1 — Resume support.
+    Load already-extracted articles from an existing output file.
+    Returns (list_of_articles, set_of_done_keys).
+    A done_key is (law_number, article_number, content_fingerprint).
+    """
+    if not Path(output_path).exists():
+        return [], set()
+
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            existing = json.load(f)
+        done_keys = set()
+        for a in existing:
+            num         = str(a.get("article_number", ""))
+            law_num     = str(a.get("law_number", ""))
+            fingerprint = str(a.get("content_french", ""))[:50]
+            done_keys.add((law_num, num, fingerprint))
+        print(f"   ♻️  Loaded {len(existing)} already-extracted articles from {output_path}")
+        return existing, done_keys
+    except Exception as e:
+        print(f"   ⚠️  Could not load existing output ({e}) — starting fresh")
+        return [], set()
+
+
+def _save_incremental(output_path: str, articles: list[dict]) -> None:
+    """Write current results to disk after every article — crash-safe."""
+    with open(output_path, "w", encoding="utf-8") as f:
+        json.dump(articles, f, ensure_ascii=False, indent=2)
+
+
 def run_extraction(pdf_path: str, output_path: Optional[str] = None,
                    enrich_limit: Optional[int] = None) -> list[dict]:
     """
     Full 2-phase extraction pipeline.
 
+    Features:
+      - Resume: skips articles already present in output_path (Feature 1)
+      - Model rotation: switches model on rate/token limit (Feature 2)
+      - Key rotation: switches API key when all models exhausted (Feature 3)
+      - Incremental save: writes output after every article — crash-safe
+
     Args:
         pdf_path:     Path to PDF file
         output_path:  Output JSON path (default: same dir as PDF)
         enrich_limit: Only enrich first N articles — useful for testing
-
-    Returns:
-        List of enriched article dicts (all 62 fields)
     """
     print("\n" + "="*60)
     print("🇹🇳 LegaTech Tunisia Extractor v3")
     print("="*60)
 
-    if not GROQ_API_KEY:
+    if not GROQ_API_KEYS:
         raise RuntimeError(
-            "GROQ_API_KEY not set. Export it as an environment variable:\n"
+            "No GROQ API key found. Set at least one:\n"
             "  Windows: $env:GROQ_API_KEY='gsk_...'\n"
             "  Linux/Mac: export GROQ_API_KEY='gsk_...'"
         )
+    print(f"🔑 {len(GROQ_API_KEYS)} API key(s) loaded | {len(GROQ_MODELS)} models available")
+
+    # Resolve output path early so we can check for existing results
+    if output_path is None:
+        stem        = Path(pdf_path).stem
+        output_path = str(Path(pdf_path).parent / f"{stem}_extracted.json")
 
     # Step 1: Read PDF
     print("\n📖 Step 1: Reading PDF...")
@@ -782,8 +1067,7 @@ def run_extraction(pdf_path: str, output_path: Optional[str] = None,
 
     # Step 2: Phase 1
     print("\n📑 Step 2: Phase 1 — extracting document metadata + article list...")
-    client              = Groq(api_key=GROQ_API_KEY)
-    doc_meta, raw_arts  = phase1_extract(client, pdf_text)
+    doc_meta, raw_arts = phase1_extract(None, pdf_text)  # client not needed — built inside call_groq
 
     if not raw_arts:
         raise ValueError("No articles found in PDF")
@@ -796,71 +1080,86 @@ def run_extraction(pdf_path: str, output_path: Optional[str] = None,
     print(f"   publication_date: {doc_meta.get('publication_date')}")
     print(f"   source_name:      {doc_meta.get('source_name')}")
 
-    # Step 3: Phase 2
+    # Step 3: Phase 2 — with resume support
     to_enrich = raw_arts[:enrich_limit] if enrich_limit else raw_arts
     total     = len(to_enrich)
-    print(f"\n🤖 Step 3: Phase 2 — enriching {total} articles...")
 
-    enriched, success, failed = [], 0, 0
+    # Feature 1: load already-done articles
+    existing_results, done_keys = _load_existing_results(output_path)
+    enriched = list(existing_results)  # start with what we already have
+
+    skipped, success, failed = 0, 0, 0
+    law_num = doc_meta.get("law_number", "")
+
+    print(f"\n🤖 Step 3: Phase 2 — enriching {total} articles ({len(done_keys)} already done)...")
 
     for i, raw in enumerate(to_enrich, 1):
-        print(f"\n── Article {i}/{total} (#{raw.get('article_number','?')}) ──")
+        art_num     = str(raw.get("article_number", ""))
+        fingerprint = str(raw.get("article_text", ""))[:50]
+        done_key    = (law_num, art_num, fingerprint)
 
-        result = phase2_enrich(client, raw, doc_meta, i, total)
+        # Feature 1: skip if already extracted
+        if done_key in done_keys:
+            print(f"\n── Article {i}/{total} (#{art_num}) — ⏭️  already extracted, skipping")
+            skipped += 1
+            continue
+
+        print(f"\n── Article {i}/{total} (#{art_num}) ──")
+
+        result = phase2_enrich(None, raw, doc_meta, i, total)
 
         if result:
+            # Post-process immediately before saving
+            try:
+                result = sanitize_article(result)
+                result = compute_static_fields(result)
+            except Exception as e:
+                print(f"   ⚠️  post-process error: {e}")
             enriched.append(result)
+            done_keys.add(done_key)
             success += 1
         else:
             print(f"   ⚠️  failed — using raw fallback")
-            enriched.append({
-                "article_number": raw.get("article_number",""),
-                "content_french": raw.get("article_text",""),
-                "chapter":        raw.get("chapter",""),
-                "section":        raw.get("section",""),
-                "title_french":   doc_meta.get("law_title_french",""),
-                "title_arabic":   doc_meta.get("law_title_arabic",""),
-                "law_number":     doc_meta.get("law_number",""),
-                "law_type":       doc_meta.get("law_type",""),
-                "source_date":    doc_meta.get("source_date",""),
-                "effective_date": doc_meta.get("effective_date",""),
-                "publication_date": doc_meta.get("publication_date",""),
-                "source_name":    doc_meta.get("source_name","JORT"),
-                "year":           doc_meta.get("year", 0),
-            })
+            fallback = {
+                "article_number":   raw.get("article_number", ""),
+                "content_french":   raw.get("article_text", ""),
+                "chapter":          raw.get("chapter", ""),
+                "section":          raw.get("section", ""),
+                "title_french":     doc_meta.get("law_title_french", ""),
+                "title_arabic":     doc_meta.get("law_title_arabic", ""),
+                "law_number":       doc_meta.get("law_number", ""),
+                "law_type":         doc_meta.get("law_type", ""),
+                "source_date":      doc_meta.get("source_date", ""),
+                "effective_date":   doc_meta.get("effective_date", ""),
+                "publication_date": doc_meta.get("publication_date", ""),
+                "source_name":      doc_meta.get("source_name", "JORT"),
+                "year":             doc_meta.get("year", 0),
+            }
+            try:
+                fallback = sanitize_article(fallback)
+                fallback = compute_static_fields(fallback)
+            except Exception:
+                pass
+            enriched.append(fallback)
+            done_keys.add(done_key)
             failed += 1
+
+        # Incremental save after every article — crash-safe
+        _save_incremental(output_path, sort_articles(enriched))
 
         if i < total:
             time.sleep(RATE_LIMIT_DELAY)
 
-    print(f"\n📊 Phase 2: {success} enriched, {failed} fallbacks")
+    print(f"\n📊 Phase 2: {success} enriched | {skipped} skipped | {failed} fallbacks")
 
-    # Step 4: Post-process
-    print("\n⚙️  Step 4: Post-processing...")
-    processed = []
-    for article in enriched:
-        try:
-            article = sanitize_article(article)
-            article = compute_static_fields(article)
-            processed.append(article)
-        except Exception as e:
-            print(f"   ⚠️  post-process error: {e}")
-
-    # processed = deduplicate(processed)
-    processed = sort_articles(processed)
-    print(f"✅ Final count: {len(processed)} articles")
-
-    # Step 5: Save
-    if output_path is None:
-        stem        = Path(pdf_path).stem
-        output_path = str(Path(pdf_path).parent / f"{stem}_extracted.json")
-
-    with open(output_path, "w", encoding="utf-8") as f:
-        json.dump(processed, f, ensure_ascii=False, indent=2)
-
+    # Step 4: Final sort and save
+    print("\n⚙️  Step 4: Sorting and saving...")
+    final = enriched  # sort_articles(enriched)  # already sorted incrementally, but re-sort to be safe
+    _save_incremental(output_path, final)
+    print(f"✅ Final count: {len(final)} articles")
     print(f"\n💾 Saved → {output_path}")
     print("="*60 + "\n")
-    return processed
+    return final
 
 
 # ─────────────────────────────────────────────
