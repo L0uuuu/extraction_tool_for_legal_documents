@@ -9,7 +9,7 @@ import os
 import time
 import re
 
-OUTPUT_DIR = "pdfs"
+OUTPUT_DIR = "pdfs/Journal_Officiel_Lois_Decrets_Decisions_Avis"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
 START_URL = "http://www.iort.gov.tn/WD120AWP/WD120Awp.exe/CONNECT/SITEIORT"
