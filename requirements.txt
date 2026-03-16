@@ -1,4 +1,11 @@
+# This file lists the dependencies for the project. You can install them using pip:
+# pip install -r requirements.txt
 groq>=0.9.0
 pdfplumber>=0.11.0
 python-dotenv>=1.0.0
 openai
+playwright>=1.30.0
+
+
+# This is a marker for the Playwright dependency to install Chromium.
+# playwright install chromium
