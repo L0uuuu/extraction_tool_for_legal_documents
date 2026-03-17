@@ -1,69 +1,67 @@
 # Journal officiel des lois, décrets, décisions et avis
-# this tool is for scraping the JORT website and downloading all the issues
-# for a given period defined by START_YEAR and END_YEAR.
+# Downloads all issues for a range of years using the year selector.
 # Files are saved under:
 #   pdfs/Journal_Officiel_Lois_Decrets_Decisions_Avis/
 #       2024/
 #       2025/
 #       2026/
-#       ...
 
 from playwright.sync_api import sync_playwright
-from datetime import date, timedelta
 import os
-import time
 import re
+import time
 
 # ============================================================
-#  CONFIGURATION — change these two values to set the period
+#  CONFIGURATION
 # ============================================================
-START_YEAR = 1991   # first year to download (January 1st)
-END_YEAR   = 1995   # last year to download  (December 31st, or today if current year)
+START_YEAR = 1991
+END_YEAR   = 1995
 # ============================================================
 
 START_URL = "http://www.iort.gov.tn/WD120AWP/WD120Awp.exe/CONNECT/SITEIORT"
 BASE_DIR  = "pdfs/Journal_Officiel_Lois_Decrets_Decisions_Avis"
 
-start_date = date(START_YEAR, 1, 1)
-
-# If END_YEAR is the current year, stop at today; otherwise go to Dec 31
-if END_YEAR >= date.today().year:
-    end_date = date.today()
-else:
-    end_date = date(END_YEAR, 12, 31)
-
-# Pre-create one subfolder per year in the range
 for y in range(START_YEAR, END_YEAR + 1):
     os.makedirs(os.path.join(BASE_DIR, str(y)), exist_ok=True)
-
-print(f"📆 Period  : {start_date} → {end_date}")
-print(f"📂 Output  : {BASE_DIR}/<year>/\n")
 
 def parse_issue(text):
     match = re.search(r'(\d+)\s+بتاريخ\s+(\d{2}/\d{2}/\d{4})', text)
     if match:
         issue = match.group(1).zfill(3)
         d, m, y = match.group(2).split('/')
-        return issue, f"{y}-{m}-{d}"
-    return None, None
-
-def fill_date(page, date_str):
-    page.evaluate(f"""
-        var inp = document.getElementById('A4');
-        inp.focus();
-        inp.value = '{date_str}';
-        inp.dispatchEvent(new Event('input', {{bubbles: true}}));
-        inp.dispatchEvent(new Event('change', {{bubbles: true}}));
-        inp.blur();
-        inp.dispatchEvent(new Event('blur', {{bubbles: true}}));
-    """)
-    page.wait_for_timeout(300)
+        return issue, f"{y}-{m}-{d}", y
+    return None, None, None
 
 def go_to_search(page):
+    """Navigate from homepage to the search page."""
     page.goto(START_URL, wait_until="networkidle", timeout=30000)
     page.click('a[name="A8"]')
     page.wait_for_load_state("networkidle")
-    page.wait_for_selector('input#A4', timeout=15000)
+    page.wait_for_selector('select#A11', timeout=15000)
+    page.wait_for_timeout(500)
+
+def get_rows(page):
+    """Extract all rows from current table page. Returns [] on error."""
+    try:
+        page.wait_for_selector('div[id^="A3_"]', timeout=10000)
+        page.wait_for_timeout(500)
+        rows = []
+        for div in page.query_selector_all('div[id^="A3_"]'):
+            try:
+                div_id    = div.get_attribute('id')
+                row_index = div_id.split('_')[1]
+                info_el   = div.query_selector('a[name="A8"]')
+                if info_el:
+                    text = info_el.inner_text().strip()
+                    issue_num, date_iso, issue_year = parse_issue(text)
+                    if issue_num:
+                        rows.append((issue_num, date_iso, issue_year, row_index))
+            except:
+                continue
+        return rows
+    except Exception as e:
+        print(f"     ⚠️  get_rows error: {e}")
+        return []
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
@@ -71,94 +69,116 @@ with sync_playwright() as p:
     page = context.new_page()
 
     total_downloaded = 0
-    total_skipped = 0
-    total_no_result = 0
+    total_skipped    = 0
 
-    current = start_date
-    while current <= end_date:
-        date_str = current.strftime("%d/%m/%Y")
+    for year in range(START_YEAR, END_YEAR + 1):
+        print(f"\n{'='*50}")
+        print(f"📅 Processing year {year}...")
+        print(f"{'='*50}")
 
-        # Year subfolder for this date
-        year_dir = os.path.join(BASE_DIR, str(current.year))
-
+        # Step 1: Navigate to search page
         try:
             go_to_search(page)
         except Exception as e:
-            print(f"  📅 {date_str} → ❌ Navigation error: {e}")
-            current += timedelta(days=1)
+            print(f"  ❌ Navigation error: {e}")
             continue
 
-        fill_date(page, date_str)
-
+        # Step 2: Select the year from dropdown
         try:
-            page.click('img[name="z_A40_IMG"]')
+            page.select_option('select#A11', label=str(year))
             page.wait_for_load_state("networkidle", timeout=15000)
             page.wait_for_timeout(800)
         except Exception as e:
-            print(f"  📅 {date_str} → ❌ Submit error: {e}")
-            current += timedelta(days=1)
+            print(f"  ❌ Year select error: {e}")
             continue
 
+        # Step 3: Click the search button (mandatory)
         try:
-            result_el   = page.query_selector('a[name="A8"]')
-            download_el = page.query_selector('a[name="A15"]')
-
-            if not result_el or not download_el:
-                print(f"  📅 {date_str} → no issue")
-                total_no_result += 1
-                current += timedelta(days=1)
-                continue
-
-            result_text = result_el.inner_text().strip()
-            issue_num, date_iso = parse_issue(result_text)
-
-            if not issue_num:
-                print(f"  📅 {date_str} → no issue")
-                total_no_result += 1
-                current += timedelta(days=1)
-                continue
-
-            if date_iso != current.strftime("%Y-%m-%d"):
-                print(f"  📅 {date_str} → no issue (closest: {date_iso})")
-                total_no_result += 1
-                current += timedelta(days=1)
-                continue
-
+            page.wait_for_selector('img[name="z_A40_IMG"]', timeout=10000)
+            page.click('img[name="z_A40_IMG"]')
+            page.wait_for_load_state("networkidle", timeout=15000)
+            page.wait_for_timeout(1000)
+            print(f"  ✅ Search submitted for {year}")
         except Exception as e:
-            print(f"  📅 {date_str} → ❌ Parse error: {e}")
-            current += timedelta(days=1)
+            print(f"  ❌ Search button error: {e}")
             continue
 
-        filename = f"JORT_{issue_num}_{date_iso}.pdf"
-        filepath = os.path.join(year_dir, filename)
+        table_page      = 1
+        year_downloaded = 0
+        year_skipped    = 0
 
-        if os.path.exists(filepath):
-            print(f"  📅 {date_str} → ⏩ {filename}")
-            total_skipped += 1
-            current += timedelta(days=1)
-            continue
+        while True:
+            print(f"\n  📄 Table page {table_page}...")
 
-        try:
-            with page.expect_download(timeout=30000) as dl_info:
-                page.click('a[name="A15"]')
-            dl = dl_info.value
-            dl.save_as(filepath)
-            print(f"  📅 {date_str} → ✅ {filename}")
-            total_downloaded += 1
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"  📅 {date_str} → ❌ Download error: {e}")
+            rows = get_rows(page)
+            print(f"     Found {len(rows)} issues")
 
-        current += timedelta(days=1)
+            if not rows:
+                print("     No rows found, stopping.")
+                break
+
+            for issue_num, date_iso, issue_year, row_index in rows:
+                folder_year = issue_year if issue_year else str(year)
+                year_dir    = os.path.join(BASE_DIR, folder_year)
+                os.makedirs(year_dir, exist_ok=True)
+
+                filename = f"JORT_{issue_num}_{date_iso}.pdf"
+                filepath = os.path.join(year_dir, filename)
+
+                if os.path.exists(filepath):
+                    print(f"     {issue_num} ({date_iso}) → ⏩ already exists")
+                    year_skipped += 1
+                    continue
+
+                try:
+                    page.evaluate(f"_PAGE_.A3.value = {row_index};")
+                    page.wait_for_timeout(200)
+                    div = page.query_selector(f'div#A3_{row_index}')
+                    btn = div.query_selector('a[name="A15"]')
+                    with page.expect_download(timeout=30000) as dl_info:
+                        btn.click()
+                    dl = dl_info.value
+                    dl.save_as(filepath)
+                    print(f"     {issue_num} ({date_iso}) → ✅ {filename}")
+                    year_downloaded += 1
+                    time.sleep(0.5)
+                except Exception as e:
+                    print(f"     {issue_num} ({date_iso}) → ❌ {e}")
+
+            # Find ">" next page button
+            next_link = None
+            try:
+                for a in page.query_selector_all('a[href*="ZR_RechercheArijJORTPlusieurs"]'):
+                    if a.inner_text().strip() == '>':
+                        next_link = a
+                        break
+            except:
+                pass
+
+            if not next_link:
+                print(f"\n  ✅ No more pages for {year}.")
+                break
+
+            print(f"\n  ➡️  Next table page...")
+            try:
+                next_href = "http://www.iort.gov.tn" + next_link.get_attribute('href')
+                page.goto(next_href, wait_until="networkidle", timeout=30000)
+                page.wait_for_timeout(800)
+                table_page += 1
+            except Exception as e:
+                print(f"  ❌ Pagination error: {e}")
+                break
+
+        total_downloaded += year_downloaded
+        total_skipped    += year_skipped
+        print(f"\n  📊 Year {year}: Downloaded {year_downloaded} | Skipped {year_skipped}")
 
     browser.close()
     print(f"""
 {'='*50}
-✅ Done!
-  Period     : {start_date} → {end_date}
+✅ All done!
   Downloaded : {total_downloaded}
   Skipped    : {total_skipped}
-  No issue   : {total_no_result}
   Saved to   : ./{BASE_DIR}/<year>/
 {'='*50}
 """)
