@@ -162,7 +162,7 @@ with sync_playwright() as p:
             print(f"\n  ➡️  Next table page...")
             try:
                 next_href = "http://www.iort.gov.tn" + next_link.get_attribute('href')
-                page.goto(next_href, wait_until="networkidle", timeout=30000)
+                page.goto(next_href, wait_until="networkidle", timeout=60000)
                 page.wait_for_timeout(800)
                 table_page += 1
             except Exception as e:
