@@ -1,7 +1,12 @@
 # Journal officiel des lois, décrets, décisions et avis
-# this tool is for scraping the JORT website and downloading all the issues from 2026-01-01 to today.
-
-
+# this tool is for scraping the JORT website and downloading all the issues
+# for a given period defined by START_YEAR and END_YEAR.
+# Files are saved under:
+#   pdfs/Journal_Officiel_Lois_Decrets_Decisions_Avis/
+#       2024/
+#       2025/
+#       2026/
+#       ...
 
 from playwright.sync_api import sync_playwright
 from datetime import date, timedelta
@@ -9,13 +14,30 @@ import os
 import time
 import re
 
-OUTPUT_DIR = "pdfs/Journal_Officiel_Lois_Decrets_Decisions_Avis"
-os.makedirs(OUTPUT_DIR, exist_ok=True)
+# ============================================================
+#  CONFIGURATION — change these two values to set the period
+# ============================================================
+START_YEAR = 1991   # first year to download (January 1st)
+END_YEAR   = 1995   # last year to download  (December 31st, or today if current year)
+# ============================================================
 
 START_URL = "http://www.iort.gov.tn/WD120AWP/WD120Awp.exe/CONNECT/SITEIORT"
+BASE_DIR  = "pdfs/Journal_Officiel_Lois_Decrets_Decisions_Avis"
 
-start_date = date(2026, 1, 1)
-end_date = date.today()
+start_date = date(START_YEAR, 1, 1)
+
+# If END_YEAR is the current year, stop at today; otherwise go to Dec 31
+if END_YEAR >= date.today().year:
+    end_date = date.today()
+else:
+    end_date = date(END_YEAR, 12, 31)
+
+# Pre-create one subfolder per year in the range
+for y in range(START_YEAR, END_YEAR + 1):
+    os.makedirs(os.path.join(BASE_DIR, str(y)), exist_ok=True)
+
+print(f"📆 Period  : {start_date} → {end_date}")
+print(f"📂 Output  : {BASE_DIR}/<year>/\n")
 
 def parse_issue(text):
     match = re.search(r'(\d+)\s+بتاريخ\s+(\d{2}/\d{2}/\d{4})', text)
@@ -56,6 +78,9 @@ with sync_playwright() as p:
     while current <= end_date:
         date_str = current.strftime("%d/%m/%Y")
 
+        # Year subfolder for this date
+        year_dir = os.path.join(BASE_DIR, str(current.year))
+
         try:
             go_to_search(page)
         except Exception as e:
@@ -74,10 +99,8 @@ with sync_playwright() as p:
             current += timedelta(days=1)
             continue
 
-        # The exact match is always in a[name='A8']
-        # It contains: رائد عدد : 001 بتاريخ 02/01/2026
         try:
-            result_el = page.query_selector('a[name="A8"]')
+            result_el   = page.query_selector('a[name="A8"]')
             download_el = page.query_selector('a[name="A15"]')
 
             if not result_el or not download_el:
@@ -95,7 +118,6 @@ with sync_playwright() as p:
                 current += timedelta(days=1)
                 continue
 
-            # Verify the result matches the searched date
             if date_iso != current.strftime("%Y-%m-%d"):
                 print(f"  📅 {date_str} → no issue (closest: {date_iso})")
                 total_no_result += 1
@@ -108,7 +130,7 @@ with sync_playwright() as p:
             continue
 
         filename = f"JORT_{issue_num}_{date_iso}.pdf"
-        filepath = os.path.join(OUTPUT_DIR, filename)
+        filepath = os.path.join(year_dir, filename)
 
         if os.path.exists(filepath):
             print(f"  📅 {date_str} → ⏩ {filename}")
@@ -116,7 +138,6 @@ with sync_playwright() as p:
             current += timedelta(days=1)
             continue
 
-        # Download via a[name='A15']
         try:
             with page.expect_download(timeout=30000) as dl_info:
                 page.click('a[name="A15"]')
@@ -131,4 +152,13 @@ with sync_playwright() as p:
         current += timedelta(days=1)
 
     browser.close()
-    print(f"\n✅ Done! Downloaded: {total_downloaded} | Skipped: {total_skipped} | No issue: {total_no_result}")
+    print(f"""
+{'='*50}
+✅ Done!
+  Period     : {start_date} → {end_date}
+  Downloaded : {total_downloaded}
+  Skipped    : {total_skipped}
+  No issue   : {total_no_result}
+  Saved to   : ./{BASE_DIR}/<year>/
+{'='*50}
+""")
