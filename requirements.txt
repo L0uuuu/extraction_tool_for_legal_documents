@@ -5,7 +5,7 @@ pdfplumber>=0.11.0
 python-dotenv>=1.0.0
 openai
 playwright>=1.30.0
-
+mistralai>=2.0.0
 
 # This is a marker for the Playwright dependency to install Chromium.
 # playwright install chromium

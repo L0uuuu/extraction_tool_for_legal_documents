@@ -1,4 +1,10 @@
 .venv
 .env
+venv
+
 test.py
+
 pdfs
+ocr_output
+
+test*.py
