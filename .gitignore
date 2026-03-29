@@ -1,6 +1,7 @@
 .venv
 .env
 venv
+credentials.json
 
 test.py
 

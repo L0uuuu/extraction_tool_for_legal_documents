@@ -6,7 +6,7 @@ Two-phase pipeline:
   Phase 2 : Each raw article individually → LLM → all 62 enriched fields
 
 API backend: Cloudflare Workers AI
-  Endpoint : https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1/responses
+  Endpoint : https://api.cloudflare.com/client/v4/accounts/{ACCOUNT_ID}/ai/v1
   Model    : @cf/openai/gpt-oss-20b
   Auth     : Bearer token via CF_AUTH_TOKEN env var
   Account  : CF_ACCOUNT_ID env var
@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Optional
 import os
 from openai import OpenAI
-import pdfplumber
+import fitz  # pymupdf
 
 # ── optional .env support ──────────────────────
 try:
@@ -67,7 +67,7 @@ ABSOLUTE RULES — never break these:
 - Dates: ISO 8601 format YYYY-MM-DDT00:00:00Z
 - status values: ACTIVE | AMENDED | REPEALED | SUSPENDED
 - business_impact values: LOW | MEDIUM | HIGH
-- article_type values: REGULATORY | PENAL | PROCEDURAL | DEFINITIONAL | TRANSITIONAL | ABROGATION
+- article_type values: ARTICLE | DECREE | NOMINATION | MINUTES | CORRECTION | GOV_ORDER | CIRCULAR | REGULATORY | PENAL | PROCEDURAL | DEFINITIONAL | TRANSITIONAL | ABROGATION
 - ambiguity_level values: LOW | MEDIUM | HIGH
 - relation_types values: REFERENCES | AMENDS | REPEALS | IMPLEMENTS | SUPERSEDES
 - entity_types values: ORGANIZATION | INSTITUTION | COURT | MINISTRY | PERSON
@@ -80,24 +80,36 @@ ABSOLUTE RULES — never break these:
 # PHASE 1 PROMPT — document metadata + raw articles
 # ─────────────────────────────────────────────
 
-PDF_PARSE_PROMPT = """Analyze this Tunisian legal document text and return a JSON object with two things:
-1. Document-level metadata found in the header, preamble, or any part of the text
-2. A complete list of every article found in the text
+PDF_PARSE_PROMPT = """You are reading a chunk of a Tunisian official legal document.
+Your task: identify and INDEX every important legal unit — do NOT copy the full text.
 
-RETURN THIS EXACT STRUCTURE as MINIFIED JSON (no whitespace, no newlines):
-{"doc_metadata":{"law_type":"Loi or Décret etc","law_number":"number only","law_title_french":"official French title","law_title_arabic":"official Arabic title","institution":"issuing authority","source_name":"JORT or BCT or OTHER","source_date":"ISO 8601 date or empty","effective_date":"ISO 8601 date or empty","publication_date":"ISO 8601 date or empty","year":0},"articles":[{"article_number":"1","article_text":"complete verbatim text","chapter":"chapter title or empty","section":"section title or empty"}]}
+A legal unit is ANY of:
+  - قرار    (decree/decision by a minister)
+  - بمقتضى قرار / تسمية / تكليف  (nomination or appointment)
+  - محضر جلسة  (meeting minutes)
+  - إصلاح خطأ  (erratum/correction)
+  - أمر حكومي  (governmental order)
+  - فصل / مادة  (article inside a law)
+  - Any other official legal text
 
-RULES:
-- article_text must be the FULL verbatim text — never summarize or truncate
-- Extract EVERY article you can find — look for: Article X, Art. X, المادة X
-- For doc_metadata: scan the entire text including headers, preambles, signatures
-- For dates: look for patterns like "du 28 avril 1966", "le 1er mai 1966", "J.O.R.T. n°35 du..."
-- If a field is not found, use "" — NEVER invent values
+For EACH unit return ONE object. doc_metadata: fill what you find, "" if absent.
 
-DOCUMENT TEXT:
+RETURN MINIFIED JSON:
+{"doc_metadata":{"law_type":"","law_number":"","law_title_arabic":"","institution":"","source_name":"JORT","source_date":"","effective_date":"","publication_date":"","year":0},"units":[{"unit_type":"DECREE or NOMINATION or ARTICLE or MINUTES or CORRECTION or GOV_ORDER","unit_title":"full Arabic title of this unit (first line/heading)","unit_number":"sequential or article number","anchor":"EXACT first 80 characters of this unit as they appear in the text"}]}
+
+CRITICAL RULES:
+- anchor must be the EXACT first 80 characters of the unit copied verbatim from the text
+- unit_title is the heading/title line of the unit (e.g. "قرار من وزير الصحة مؤرخ في 2 فيفري 2026 يتعلق...")
+- Do NOT include unit_text — we extract the full text in a separate step
+- Skip table of contents lines (lines ending with page numbers after dots .......)
+- Each distinct legal unit = one object in units array
+- If the same unit appears in TOC and again as content, use the content version for the anchor
+
+DOCUMENT CHUNK:
 {pdf_text}
 
 RETURN ONLY THE MINIFIED JSON. NO MARKDOWN. NO EXPLANATIONS."""
+
 
 # ─────────────────────────────────────────────
 # PHASE 2 PROMPT — enrich one article (all 62 fields)
@@ -196,8 +208,16 @@ FIELD DEFINITIONS
   target_audience  : Array of affected parties in French. NEVER empty. E.g. ["Entreprises", "Salariés"]
   status           : ACTIVE | AMENDED | REPEALED | SUSPENDED
 
-  article_type   : REGULATORY | PENAL | PROCEDURAL | DEFINITIONAL | TRANSITIONAL | ABROGATION
-  article_order  : Integer version of article_number (e.g. 6). For "14 quater" use 14.
+  article_type   : The type of this legal unit. Use the unit_type from the raw data if present, otherwise infer:
+                   ARTICLE     — a numbered فصل inside a decree or law
+                   DECREE      — a full قرار (decision/decree) by a minister or authority
+                   NOMINATION  — a بمقتضى قرار appointing or assigning a person
+                   MINUTES     — محضر جلسة meeting minutes
+                   CORRECTION  — إصلاح خطأ erratum / correction
+                   GOV_ORDER   — أمر حكومي governmental order
+                   CIRCULAR    — منشور / دورية circular
+                   REGULATORY | PENAL | PROCEDURAL | DEFINITIONAL | TRANSITIONAL | ABROGATION — for plain articles
+  article_order  : Integer sequence number of this unit within the document (e.g. 1, 2, 3...).
 
   ambiguity_level : LOW | MEDIUM | HIGH
 
@@ -238,59 +258,79 @@ DO NOT include any text before or after the JSON.
 # PDF TEXT EXTRACTION
 # ─────────────────────────────────────────────
 
-def extract_text_from_pdf(pdf_path: str) -> str:
+def extract_text_from_pdf(pdf_path: str) -> tuple[str, list[str]]:
+    """
+    Extract text from PDF using pymupdf (fitz).
+    Returns (full_text, pages) where pages is a list of per-page strings.
+    pymupdf handles Arabic RTL and Unicode correctly — no character reversal issues.
+    Per-page list is used by the gazette splitter.
+    """
     path = Path(pdf_path)
     if not path.exists():
         raise FileNotFoundError(f"PDF not found: {pdf_path}")
 
-    pages_text = []
-    with pdfplumber.open(pdf_path) as pdf:
-        print(f"📄 PDF loaded: {len(pdf.pages)} pages")
-        for page in pdf.pages:
-            text = page.extract_text()
-            if text and text.strip():
-                pages_text.append(text)
+    pages: list[str] = []
+    doc = fitz.open(pdf_path)
+    print(f"📄 PDF loaded: {len(doc)} pages")
+    for page in doc:
+        text = page.get_text()
+        if text and text.strip():
+            pages.append(text)
+    doc.close()
 
-    full_text = "\n\n".join(pages_text)
-    print(f"📝 Extracted {len(full_text):,} characters")
-    return full_text
+    full_text = "\n\n".join(pages)
+    print(f"📝 Extracted {len(full_text):,} characters from {len(pages)} pages")
+    return full_text, pages
 
 
 # ─────────────────────────────────────────────
-# CHUNKING FOR PHASE 1
+# PAGE-GROUP CHUNKING
 # ─────────────────────────────────────────────
 
-def split_for_parsing(text: str, max_chars: int = PDF_PARSE_CHUNK_CHARS) -> list[str]:
-    """Split PDF text at paragraph boundaries for Phase 1."""
-    if len(text) <= max_chars:
-        return [text]
+def is_toc_page(text: str) -> bool:
+    """
+    Return True if this page is a table of contents.
+    TOC pages have many dot-lines like: "قرار من وزير ........ 218"
+    Content pages have actual article/decree text.
+    """
+    dot_lines = sum(1 for line in text.split('\n') if line.count('.') > 5)
+    return dot_lines >= 3
+
+
+def group_pages_into_chunks(pages: list[str],
+                            max_chars: int = PDF_PARSE_CHUNK_CHARS) -> list[str]:
+    """
+    Group pages into chunks for Phase 1.
+    - Skips TOC pages entirely (no useful content for extraction)
+    - Groups consecutive pages up to max_chars per chunk
+    - Never splits a page across two chunks
+    """
+    content_pages = []
+    for i, page in enumerate(pages, 1):
+        if is_toc_page(page):
+            # Show first meaningful line so user knows what was skipped
+            first_line = next(
+                (l.strip() for l in page.split('\n') if len(l.strip()) > 10),
+                "(empty)"
+            )
+            print(f"   🗂️  Page {i} skipped (TOC): {first_line[:80]}")
+        else:
+            content_pages.append(page)
+
+    skipped = len(pages) - len(content_pages)
+    print(f"   📋 {skipped} TOC page(s) skipped | {len(content_pages)} content page(s) kept")
 
     chunks, current = [], ""
-    paragraphs = re.split(r'\n{2,}', text)
-
-    for para in paragraphs:
-        if len(para) > max_chars:
-            # Para too big — split by lines
-            for line in para.split('\n'):
-                if len(current) + len(line) + 1 > max_chars:
-                    if current.strip():
-                        chunks.append(current.strip())
-                    current = line
-                else:
-                    current += ("\n" if current else "") + line
-            continue
-
-        if len(current) + len(para) + 2 > max_chars:
-            if current.strip():
-                chunks.append(current.strip())
-            current = para
+    for page in content_pages:
+        if len(current) + len(page) > max_chars and current:
+            chunks.append(current.strip())
+            current = page
         else:
-            current += ("\n\n" if current else "") + para
+            current += ("\n\n" if current else "") + page
 
     if current.strip():
         chunks.append(current.strip())
 
-    print(f"📦 Split into {len(chunks)} parsing chunks")
     return chunks
 
 
@@ -510,38 +550,81 @@ def split_text_into_sections(pdf_text: str) -> list[tuple[str, str]]:
     return sections
 
 
-def phase1_extract(client, pdf_text: str) -> tuple[dict, list[dict]]:
+
+def phase1b_locate_units(index: list[dict], full_text: str) -> list[dict]:
     """
-    Phase 1: send PDF chunks to LLM, collect:
-      - doc_metadata (merged across chunks, first non-empty value wins)
-      - raw articles list
+    Phase 1b — pure Python, zero API calls.
 
-    DEDUPLICATION STRATEGY:
-      A Tunisian legal document often has TWO sets of articles with the same
-      numbers. For example, the Code du Travail has:
-        - Articles 1-4 in the promulgation law (pages 1-7)
-        - Articles 1-N in the code body itself (pages 9+)
-      
-      Old approach (dedup by article_number alone) dropped the second set.
-      New approach: dedup by (article_number, first_50_chars_of_text).
-      Same number + same text = true duplicate (overlap between chunks).
-      Same number + different text = different article, keep both.
-
-    Returns: (doc_metadata dict, list of raw article dicts)
+    Uses the anchors returned by Phase 1a to locate each unit's start position
+    in the full document text. End of unit N = start of unit N+1.
+    Returns the same list with `article_text` populated.
     """
-    print("\n── Phase 1: Identifying articles and document metadata ──")
+    located = []
 
-    chunks    = split_for_parsing(pdf_text)
+    # Find start position for each unit using its anchor
+    for unit in index:
+        anchor = unit.get("anchor", "").strip()
+        if not anchor:
+            continue
+        pos = full_text.find(anchor)
+        if pos == -1:
+            # Try shorter anchor (first 40 chars) in case of minor whitespace differences
+            short = anchor[:40].strip()
+            pos   = full_text.find(short)
+        if pos == -1:
+            print(f"   ⚠️  Anchor not found: {anchor[:60]!r}")
+            continue
+        unit["_start"] = pos
+        located.append(unit)
+
+    # Sort by position in document
+    located.sort(key=lambda u: u["_start"])
+
+    # Assign full text: start of this unit → start of next unit
+    enriched = []
+    for i, unit in enumerate(located):
+        start = unit["_start"]
+        end   = located[i + 1]["_start"] if i + 1 < len(located) else len(full_text)
+        text  = full_text[start:end].strip()
+
+        unit["article_text"]   = text
+        unit["article_number"] = str(unit.get("unit_number", i + 1))
+        unit.setdefault("unit_type",  "ARTICLE")
+        unit.setdefault("unit_title", "")
+        unit.setdefault("chapter",    "")
+        unit.setdefault("section",    "")
+        unit.pop("_start", None)
+        enriched.append(unit)
+
+    return enriched
+
+
+def phase1_extract(client, pdf_pages: list[str]) -> tuple[dict, list[dict]]:
+    """
+    Two-sub-step Phase 1:
+
+    1a) LLM reads each page-group chunk and returns a LIGHTWEIGHT INDEX:
+        unit_type, unit_title, unit_number, anchor (first 80 chars).
+        Output is tiny → never hits token limit.
+
+    1b) Python uses anchors to slice the full text into per-unit verbatim blocks.
+        Next anchor start = end of current unit.  Zero API calls.
+
+    Returns: (doc_metadata, list of raw unit dicts with article_text populated)
+    """
+    print("\n── Phase 1: Extracting all legal units ──")
+
+    full_text = "\n\n".join(pdf_pages)
+    chunks    = group_pages_into_chunks(pdf_pages)
     doc_meta  = dict(EMPTY_DOC_METADATA)
-    all_raw   = []
-    # Key = (article_number, first_50_chars_of_text) — catches real duplicates
-    # (same chunk overlap) while allowing same-numbered articles with different content
-    seen_keys = set()
+    raw_index: list[dict] = []
+    seen_anchors: set     = set()
 
-    print(f"📦 Split into {len(chunks)} parsing chunks")
+    print(f"📦 {len(chunks)} content chunk(s) after skipping TOC pages")
 
+    # ── 1a: LLM builds lightweight index ─────────────────────────────────────
     for i, chunk in enumerate(chunks, 1):
-        label  = f"parse {i}/{len(chunks)}"
+        label = f"parse {i}/{len(chunks)}"
         print(f"\n   [{label}] {len(chunk):,} chars...")
 
         prompt = PDF_PARSE_PROMPT.replace("{pdf_text}", chunk)
@@ -554,37 +637,45 @@ def phase1_extract(client, pdf_text: str) -> tuple[dict, list[dict]]:
         if not parsed:
             raise RuntimeError(
                 f"Phase 1 failed on chunk {i}/{len(chunks)}: "
-                f"LLM returned non-JSON.\nRaw response (first 300 chars): {(raw or '')[:300]}"
+                f"LLM returned non-JSON.\nRaw (first 300): {(raw or '')[:300]}"
             )
 
-        # Merge doc_metadata — first non-empty value wins
+        # Merge doc_metadata
         chunk_meta = parsed.get("doc_metadata", {})
         if isinstance(chunk_meta, dict):
             for key, val in chunk_meta.items():
                 if key in doc_meta and not doc_meta[key] and val:
                     doc_meta[key] = val
 
-        # Collect articles — dedup by (number, content_fingerprint)
-        articles = parsed.get("articles", [])
-        if isinstance(articles, list):
-            added = 0
-            for art in articles:
-                num         = str(art.get("article_number", "")).strip()
-                text        = str(art.get("article_text", "")).strip()
-                fingerprint = text[:50]
-                key         = (num, fingerprint)
-                if key in seen_keys:
-                    continue
-                seen_keys.add(key)
-                all_raw.append(art)
-                added += 1
-            print(f"   ✅ {added} new articles | meta so far: {doc_meta.get('law_number','?')} | total: {len(all_raw)}")
+        # Collect index entries — dedup by anchor
+        units = parsed.get("units") or parsed.get("articles") or []
+        added = 0
+        for unit in units:
+            anchor = unit.get("anchor", "").strip()[:80]
+            if not anchor or anchor in seen_anchors:
+                continue
+            seen_anchors.add(anchor)
+            unit["anchor"] = anchor
+            raw_index.append(unit)
+            added += 1
+        print(f"   ✅ {added} new units indexed | total: {len(raw_index)}")
 
         if i < len(chunks):
             time.sleep(RATE_LIMIT_DELAY)
 
-    print(f"\n✅ Phase 1 done: {len(all_raw)} articles | metadata: {doc_meta}")
+    print(f"\n── Phase 1b: Locating unit texts in document ──")
+    print(f"   Full text: {len(full_text):,} chars | {len(raw_index)} anchors")
+
+    # ── 1b: Python slices full text at anchor positions ───────────────────────
+    all_raw = phase1b_locate_units(raw_index, full_text)
+
+    located   = len(all_raw)
+    not_found = len(raw_index) - located
+    if not_found:
+        print(f"   ⚠️  {not_found} anchor(s) not found in text")
+    print(f"\n✅ Phase 1 done: {located} units located | metadata: {doc_meta}")
     return doc_meta, all_raw
+
 
 
 # ─────────────────────────────────────────────
@@ -773,6 +864,20 @@ def sanitize_article(article: dict) -> dict:
 
     # ── Fallbacks for critical fields ──
 
+    # Carry over unit_type and unit_title from Phase 1 raw data if LLM missed them
+    VALID_ARTICLE_TYPES = {
+        "ARTICLE","DECREE","NOMINATION","MINUTES","CORRECTION",
+        "GOV_ORDER","CIRCULAR","REGULATORY","PENAL","PROCEDURAL",
+        "DEFINITIONAL","TRANSITIONAL","ABROGATION"
+    }
+    if article.get("article_type","").upper() not in VALID_ARTICLE_TYPES:
+        article["article_type"] = "ARTICLE"  # safe default
+
+    # unit_title — store as title_french if not already set and we have one
+    unit_title = article.pop("unit_title", None)
+    if unit_title and not article.get("title_french"):
+        article["title_french"] = unit_title
+
     # Keywords: always in French, never empty
     if not article["keywords"]:
         text  = article.get("content_french","") or article.get("summary","")
@@ -930,82 +1035,66 @@ def run_extraction(pdf_path: str, output_path: Optional[str] = None,
         stem        = Path(pdf_path).stem
         output_path = str(Path(pdf_path).parent / f"{stem}_extracted.json")
 
-    # Step 1: Read PDF
-    print("\n📖 Step 1: Reading PDF...")
-    pdf_text = extract_text_from_pdf(pdf_path)
-
-    # Step 2: Phase 1
-    print("\n📑 Step 2: Phase 1 — extracting document metadata + article list...")
-    if dry_run:
-        print("   ⏭️  [dry-run] skipping Phase 1 LLM — no API call")
-        doc_meta = {"law_type":"","law_number":"","law_title_french":"","law_title_arabic":"",
-                    "institution":"","source_name":"JORT","source_date":"","effective_date":"",
-                    "publication_date":"","year":0}
-        # Split by known article patterns just for display — no LLM cost
-        import re as _re
-        raw_arts = [{"article_number": str(i+1), "article_text": chunk, "chapter": "", "section": ""}
-                    for i, chunk in enumerate(pdf_text.split("Article ")[1:6])]
-        if not raw_arts:
-            raw_arts = [{"article_number": "1", "article_text": pdf_text[:500], "chapter": "", "section": ""}]
-    else:
-        doc_meta, raw_arts = phase1_extract(None, pdf_text)
-
-    if not raw_arts:
-        raise ValueError("No articles found in PDF")
-
-    print(f"\n📋 Document metadata extracted:")
-    print(f"   law_type:         {doc_meta.get('law_type')}")
-    print(f"   law_number:       {doc_meta.get('law_number')}")
-    print(f"   source_date:      {doc_meta.get('source_date')}")
-    print(f"   effective_date:   {doc_meta.get('effective_date')}")
-    print(f"   publication_date: {doc_meta.get('publication_date')}")
-    print(f"   source_name:      {doc_meta.get('source_name')}")
-
-    # Step 3: Phase 2 — with resume support
     if test_mode and not enrich_limit:
         enrich_limit = 1
+
+    # Step 1: Read PDF
+    print("\n📖 Step 1: Reading PDF...")
+    pdf_text, pdf_pages = extract_text_from_pdf(pdf_path)
+
+    # Step 2: Phase 1 — LLM extracts all legal units from page-grouped chunks
+    print("\n📑 Step 2: Phase 1 — extracting all legal units...")
+    if dry_run:
+        print("   ⏭️  [dry-run] skipping Phase 1 LLM — no API call")
+        doc_meta = {"law_type":"","law_number":"","law_title_french":"",
+                    "law_title_arabic":"","institution":"","source_name":"JORT",
+                    "source_date":"","effective_date":"","publication_date":"","year":0}
+        raw_arts = [{"article_number": "1", "article_text": pdf_text[:500],
+                     "unit_type": "ARTICLE", "unit_title": "", "chapter": "", "section": ""}]
+    else:
+        doc_meta, raw_arts = phase1_extract(None, pdf_pages)
+
+    if not raw_arts:
+        raise ValueError("No legal units found in PDF")
+
+    print(f"\n📋 Metadata: law_type={doc_meta.get('law_type')} | "
+          f"law_number={doc_meta.get('law_number')} | "
+          f"source_date={doc_meta.get('source_date')}")
+
+    # Step 3: Phase 2 — enrich each unit into full 64-field format
+    enriched, done_keys = _load_existing_results(output_path)
     to_enrich = raw_arts[:enrich_limit] if enrich_limit else raw_arts
     total     = len(to_enrich)
+    law_num   = doc_meta.get("law_number", "")
+    success = skipped = 0
 
-    # Feature 1: load already-done articles
-    existing_results, done_keys = _load_existing_results(output_path)
-    enriched = list(existing_results)  # start with what we already have
-
-    skipped, success, failed = 0, 0, 0
-    law_num = doc_meta.get("law_number", "")
-
-    print(f"\n🤖 Step 3: Phase 2 — enriching {total} articles ({len(done_keys)} already done)...")
+    print(f"\n🤖 Step 3: Phase 2 — enriching {total} unit(s) ({len(done_keys)} already done)...")
 
     for i, raw in enumerate(to_enrich, 1):
+        unit_label  = raw.get("unit_title") or raw.get("unit_type") or "unit"
         art_num     = str(raw.get("article_number", ""))
-        fingerprint = str(raw.get("article_text", ""))[:50]
+        fingerprint = str(raw.get("article_text", ""))[:80]
         done_key    = (law_num, art_num, fingerprint)
 
-        # Feature 1: skip if already extracted
         if done_key in done_keys:
-            print(f"\n── Article {i}/{total} (#{art_num}) — ⏭️  already extracted, skipping")
+            print(f"\n── Unit {i}/{total} — ⏭️  already done")
             skipped += 1
             continue
 
-        print(f"\n── Article {i}/{total} (#{art_num}) ──")
+        print(f"\n── Unit {i}/{total} [{raw.get('unit_type','?')}] {unit_label[:60]} ──")
 
         if dry_run:
-            print(f"   ⏭️  [dry-run] would send {len(raw.get('article_text',''))} chars to API")
-            print(f"   📄 Preview: {raw.get('article_text','')[:120]}...")
+            print(f"   ⏭️  [dry-run] would enrich: {str(raw.get('article_text',''))[:120]}...")
             skipped += 1
             continue
 
-        # phase2_enrich raises RuntimeError on failure — stops the run immediately
         result = phase2_enrich(None, raw, doc_meta, i, total)
-
-        # Post-process
         result = sanitize_article(result)
         result = compute_static_fields(result)
         enriched.append(result)
         done_keys.add(done_key)
         success += 1
 
-        # Incremental save after every article — crash-safe
         try:
             _save_incremental(output_path, sort_articles(enriched))
         except Exception as e:
@@ -1014,13 +1103,12 @@ def run_extraction(pdf_path: str, output_path: Optional[str] = None,
         if i < total:
             time.sleep(RATE_LIMIT_DELAY)
 
-    print(f"\n📊 Phase 2: {success} enriched | {skipped} skipped | {failed} fallbacks")
-
     # Step 4: Final sort and save
+    print(f"\n📊 Total: {success} enriched | {skipped} skipped")
     print("\n⚙️  Step 4: Sorting and saving...")
     final = sort_articles(enriched)
     _save_incremental(output_path, final)
-    print(f"✅ Final count: {len(final)} articles")
+    print(f"✅ Final count: {len(final)} units")
     print(f"\n💾 Saved → {output_path}")
     print("="*60 + "\n")
     return final
