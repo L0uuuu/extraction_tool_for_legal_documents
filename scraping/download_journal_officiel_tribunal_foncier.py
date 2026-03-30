@@ -113,7 +113,7 @@ with sync_playwright() as p:
                     continue
 
                 try:
-                    with page.expect_download(timeout=30000) as dl_info:
+                    with page.expect_download(timeout=60000) as dl_info:
                         date_link.click()
                     dl = dl_info.value
                     dl.save_as(filepath)

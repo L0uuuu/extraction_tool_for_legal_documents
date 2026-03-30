@@ -14,8 +14,8 @@ import time
 # ============================================================
 #  CONFIGURATION
 # ============================================================
-START_YEAR = 1991
-END_YEAR   = 1995
+START_YEAR = 2024
+END_YEAR   = 2025
 # ============================================================
 
 START_URL = "http://www.iort.gov.tn/WD120AWP/WD120Awp.exe/CONNECT/SITEIORT"
@@ -25,7 +25,11 @@ for y in range(START_YEAR, END_YEAR + 1):
     os.makedirs(os.path.join(BASE_DIR, str(y)), exist_ok=True)
 
 def parse_issue(text):
-    match = re.search(r'(\d+)\s+بتاريخ\s+(\d{2}/\d{2}/\d{4})', text)
+    """
+    Parse issue number and date from text like:
+    "JORT n°: 156 du 31/12/2025"
+    """
+    match = re.search(r'JORT n°:\s*(\d+)\s+du\s+(\d{2}/\d{2}/\d{4})', text)
     if match:
         issue = match.group(1).zfill(3)
         d, m, y = match.group(2).split('/')
@@ -34,14 +38,56 @@ def parse_issue(text):
 
 def go_to_search(page):
     """Navigate from homepage to the search page."""
+    print("  🌐 Loading homepage...")
     page.goto(START_URL, wait_until="networkidle", timeout=30000)
-    page.click('a[name="A8"]')
-    page.wait_for_load_state("networkidle")
-    page.wait_for_selector('select#A11', timeout=15000)
-    page.wait_for_timeout(500)
+    
+    # Step 1: Click the "Français" link to ensure correct language/interface
+    try:
+        page.wait_for_selector('a[name="M32"]', timeout=10000)
+        page.click('a[name="M32"]')
+        page.wait_for_load_state("networkidle", timeout=15000)
+        print("  ✅ Clicked 'Français' link")
+        page.wait_for_timeout(1000)
+    except Exception as e:
+        print(f"  ⚠️ Could not click Français link: {e}")
+        # Continue anyway - maybe already in French or the link is not needed
+    
+    # Step 2: Click the "Journal officiel (lois, décrets, arrêtés et avis)" link (M7)
+    try:
+        page.wait_for_selector('a[name="M7"]', timeout=10000)
+        page.click('a[name="M7"]')
+        page.wait_for_load_state("networkidle", timeout=15000)
+        print("  ✅ Clicked 'Journal officiel (lois, décrets, arrêtés et avis)' link")
+        page.wait_for_timeout(1000)
+    except Exception as e:
+        print(f"  ❌ Could not click Journal officiel link: {e}")
+        raise
+    
+    # Step 3: Click the "Recherche journal" link (A21)
+    try:
+        page.wait_for_selector('a[name="A21"]', timeout=10000)
+        page.click('a[name="A21"]')
+        page.wait_for_load_state("networkidle", timeout=15000)
+        print("  ✅ Clicked 'Recherche journal' link")
+        page.wait_for_timeout(1000)
+    except Exception as e:
+        print(f"  ❌ Could not click Recherche journal link: {e}")
+        raise
+    
+    # Step 4: Wait for the search page to be fully loaded with the year selector
+    try:
+        page.wait_for_selector('select#A11', timeout=15000)
+        print("  ✅ Search page loaded, year selector found")
+        page.wait_for_timeout(500)
+    except Exception as e:
+        print(f"  ❌ Search page did not load properly: {e}")
+        raise
 
 def get_rows(page):
-    """Extract all rows from current table page. Returns [] on error."""
+    """
+    Extract all rows from current table page.
+    Rows are contained in divs with id like "A3_1", "A3_2", etc.
+    """
     try:
         page.wait_for_selector('div[id^="A3_"]', timeout=10000)
         page.wait_for_timeout(500)
@@ -50,18 +96,36 @@ def get_rows(page):
             try:
                 div_id    = div.get_attribute('id')
                 row_index = div_id.split('_')[1]
-                info_el   = div.query_selector('a[name="A8"]')
+                
+                info_el = div.query_selector('a[name="A8"]')
                 if info_el:
                     text = info_el.inner_text().strip()
                     issue_num, date_iso, issue_year = parse_issue(text)
                     if issue_num:
                         rows.append((issue_num, date_iso, issue_year, row_index))
-            except:
+            except Exception as e:
+                print(f"     ⚠️  Error parsing row {div_id}: {e}")
                 continue
         return rows
     except Exception as e:
         print(f"     ⚠️  get_rows error: {e}")
         return []
+
+def get_next_page_url(page):
+    """Find the '>' link for next page navigation."""
+    try:
+        pagination_td = page.query_selector('td#A6')
+        if pagination_td:
+            for a in pagination_td.query_selector_all('a'):
+                if a.inner_text().strip() == '>':
+                    href = a.get_attribute('href')
+                    if href:
+                        if href.startswith('/'):
+                            return "http://www.iort.gov.tn" + href
+                        return href
+    except Exception as e:
+        print(f"     ⚠️  Error finding next page: {e}")
+    return None
 
 with sync_playwright() as p:
     browser = p.chromium.launch(headless=False)
@@ -76,7 +140,7 @@ with sync_playwright() as p:
         print(f"📅 Processing year {year}...")
         print(f"{'='*50}")
 
-        # Step 1: Navigate to search page
+        # Step 1: Navigate to search page (with all required clicks)
         try:
             go_to_search(page)
         except Exception as e:
@@ -88,12 +152,14 @@ with sync_playwright() as p:
             page.select_option('select#A11', label=str(year))
             page.wait_for_load_state("networkidle", timeout=15000)
             page.wait_for_timeout(800)
+            print(f"  ✅ Selected year {year}")
         except Exception as e:
             print(f"  ❌ Year select error: {e}")
             continue
 
-        # Step 3: Click the search button (mandatory)
+        # Step 3: Click the search button (the magnifying glass image)
         try:
+            # The search button is an image with name="z_A40_IMG"
             page.wait_for_selector('img[name="z_A40_IMG"]', timeout=10000)
             page.click('img[name="z_A40_IMG"]')
             page.wait_for_load_state("networkidle", timeout=15000)
@@ -131,10 +197,21 @@ with sync_playwright() as p:
                     continue
 
                 try:
+                    # Set the row index in the page's JavaScript variable
                     page.evaluate(f"_PAGE_.A3.value = {row_index};")
                     page.wait_for_timeout(200)
+                    
                     div = page.query_selector(f'div#A3_{row_index}')
+                    if not div:
+                        print(f"     {issue_num} ({date_iso}) → ❌ Row div not found")
+                        continue
+                    
+                    # Find the PDF download link (name="A15")
                     btn = div.query_selector('a[name="A15"]')
+                    if not btn:
+                        print(f"     {issue_num} ({date_iso}) → ❌ Download link not found")
+                        continue
+                    
                     with page.expect_download(timeout=60000) as dl_info:
                         btn.click()
                     dl = dl_info.value
@@ -145,24 +222,14 @@ with sync_playwright() as p:
                 except Exception as e:
                     print(f"     {issue_num} ({date_iso}) → ❌ {e}")
 
-            # Find ">" next page button
-            next_link = None
-            try:
-                for a in page.query_selector_all('a[href*="ZR_RechercheArijJORTPlusieurs"]'):
-                    if a.inner_text().strip() == '>':
-                        next_link = a
-                        break
-            except:
-                pass
-
-            if not next_link:
+            next_url = get_next_page_url(page)
+            if not next_url:
                 print(f"\n  ✅ No more pages for {year}.")
                 break
 
             print(f"\n  ➡️  Next table page...")
             try:
-                next_href = "http://www.iort.gov.tn" + next_link.get_attribute('href')
-                page.goto(next_href, wait_until="networkidle", timeout=60000)
+                page.goto(next_url, wait_until="networkidle", timeout=60000)
                 page.wait_for_timeout(800)
                 table_page += 1
             except Exception as e:
@@ -179,6 +246,6 @@ with sync_playwright() as p:
 ✅ All done!
   Downloaded : {total_downloaded}
   Skipped    : {total_skipped}
-  Saved to   : ./{BASE_DIR}/<year>/
+  Saved to   : ./{BASE_DIR}/<year>
 {'='*50}
 """)
